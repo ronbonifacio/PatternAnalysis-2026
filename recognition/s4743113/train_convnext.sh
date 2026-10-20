@@ -34,5 +34,6 @@ echo "Training directory: ${train_dir}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 python -u train.py \
+    --data-dir /home/groups/comp3710/ADNI/AD_NC \
     --device cuda \
     --num-workers "${SLURM_CPUS_PER_TASK:-8}"
