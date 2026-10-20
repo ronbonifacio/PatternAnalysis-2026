@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -30,6 +31,9 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_slice_level"
 IMAGE_SIZE = (224, 224)
 EARLY_STOPPING_PATIENCE = 5
 EARLY_STOPPING_MIN_DELTA = 0.001
+DEFAULT_EARLY_STOPPING_START_EPOCH = 10
+DEFAULT_WARMUP_EPOCHS = 5
+DEFAULT_GRADIENT_CLIP = 1.0
 
 
 @dataclass(frozen=True)
@@ -55,8 +59,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=48)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--stochastic-depth", type=float, default=0.0)
+    parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
+    parser.add_argument(
+        "--gradient-clip",
+        type=float,
+        default=DEFAULT_GRADIENT_CLIP,
+    )
+    parser.add_argument(
+        "--early-stopping-start-epoch",
+        type=int,
+        default=DEFAULT_EARLY_STOPPING_START_EPOCH,
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -76,6 +92,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--learning-rate must be positive")
     if args.weight_decay < 0:
         parser.error("--weight-decay cannot be negative")
+    if not 0.0 <= args.stochastic_depth < 1.0:
+        parser.error("--stochastic-depth must be in [0, 1)")
+    if args.warmup_epochs < 0:
+        parser.error("--warmup-epochs cannot be negative")
+    if args.gradient_clip <= 0:
+        parser.error("--gradient-clip must be positive")
+    if args.early_stopping_start_epoch < 0:
+        parser.error("--early-stopping-start-epoch cannot be negative")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
 
@@ -90,6 +114,7 @@ def run_epoch(
     *,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
+    gradient_clip: float | None = None,
 ) -> EpochMetrics:
     """Run one training or validation epoch and return slice-level metrics."""
 
@@ -120,9 +145,14 @@ def run_epoch(
             if is_training:
                 if scaler is None:
                     loss.backward()
+                    if gradient_clip is not None:
+                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
                     optimizer.step()
                 else:
                     scaler.scale(loss).backward()
+                    if gradient_clip is not None:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
                     scaler.step(optimizer)
                     scaler.update()
 
@@ -137,6 +167,33 @@ def run_epoch(
     return EpochMetrics(
         loss=total_loss / total_slices,
         accuracy=total_correct / total_slices,
+    )
+
+
+def create_learning_rate_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_epochs: int,
+    warmup_epochs: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warm up linearly, then decay the learning rate with a cosine curve."""
+
+    warmup_epochs = min(warmup_epochs, total_epochs)
+
+    def learning_rate_multiplier(epoch_index: int) -> float:
+        if warmup_epochs and epoch_index < warmup_epochs:
+            return (epoch_index + 1) / warmup_epochs
+
+        cosine_steps = max(total_epochs - warmup_epochs - 1, 1)
+        progress = min(
+            max(epoch_index - warmup_epochs, 0) / cosine_steps,
+            1.0,
+        )
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        learning_rate_multiplier,
     )
 
 
@@ -396,12 +453,20 @@ def main() -> None:
     ad_index = class_to_idx["AD"]
     nc_index = class_to_idx["NC"]
 
-    model = convnext_tiny(num_classes=len(class_to_idx)).to(device)
+    model = convnext_tiny(
+        num_classes=len(class_to_idx),
+        stochastic_depth_probability=args.stochastic_depth,
+    ).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
+    )
+    scheduler = create_learning_rate_scheduler(
+        optimizer,
+        total_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
@@ -417,6 +482,21 @@ def main() -> None:
     print(f"Validation slices: {len(validation_loader.dataset)}")
     print(f"Test slices: {len(test_loader.dataset)}")
     print(f"Trainable parameters: {trainable_parameters:,}")
+    print(
+        f"Base learning rate: {args.learning_rate:g}; "
+        f"warm-up epochs: {args.warmup_epochs}; "
+        f"weight decay: {args.weight_decay:g}"
+    )
+    print(
+        f"Stochastic depth: {args.stochastic_depth:g}; "
+        f"gradient clipping: {args.gradient_clip:g}"
+    )
+    print(
+        f"Early stopping: start after epoch "
+        f"{args.early_stopping_start_epoch}, patience "
+        f"{EARLY_STOPPING_PATIENCE}, minimum delta "
+        f"{EARLY_STOPPING_MIN_DELTA:g}"
+    )
 
     best_validation_loss = float("inf")
     best_epoch = 0
@@ -424,6 +504,7 @@ def main() -> None:
     history: list[dict[str, Any]] = []
 
     for epoch in range(1, args.epochs + 1):
+        epoch_learning_rate = optimizer.param_groups[0]["lr"]
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -431,6 +512,7 @@ def main() -> None:
             device,
             optimizer=optimizer,
             scaler=scaler,
+            gradient_clip=args.gradient_clip,
         )
         validation_metrics = run_epoch(
             model,
@@ -442,6 +524,7 @@ def main() -> None:
         history.append(
             {
                 "epoch": epoch,
+                "learning_rate": epoch_learning_rate,
                 "train": asdict(train_metrics),
                 "validation": asdict(validation_metrics),
             }
@@ -452,7 +535,8 @@ def main() -> None:
             f"train loss {train_metrics.loss:.4f}, "
             f"accuracy {train_metrics.accuracy:.2%} | "
             f"validation loss {validation_metrics.loss:.4f}, "
-            f"accuracy {validation_metrics.accuracy:.2%}"
+            f"accuracy {validation_metrics.accuracy:.2%} | "
+            f"lr {epoch_learning_rate:.2e}"
         )
 
         improvement = best_validation_loss - validation_metrics.loss
@@ -466,13 +550,22 @@ def main() -> None:
                 f"{best_weights_path}"
             )
         else:
-            epochs_without_improvement += 1
-            print(
-                f"  No validation-loss improvement of at least "
-                f"{EARLY_STOPPING_MIN_DELTA:.3f} "
-                f"({epochs_without_improvement}/{EARLY_STOPPING_PATIENCE})"
-            )
+            if epoch <= args.early_stopping_start_epoch:
+                epochs_without_improvement = 0
+                print(
+                    "  No minimum-delta improvement; early-stopping "
+                    f"counting begins after epoch "
+                    f"{args.early_stopping_start_epoch}."
+                )
+            else:
+                epochs_without_improvement += 1
+                print(
+                    f"  No validation-loss improvement of at least "
+                    f"{EARLY_STOPPING_MIN_DELTA:.3f} "
+                    f"({epochs_without_improvement}/{EARLY_STOPPING_PATIENCE})"
+                )
 
+        scheduler.step()
         if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
             print(
                 f"Early stopping after epoch {epoch}: validation loss did not "
@@ -514,6 +607,12 @@ def main() -> None:
                     "image_size": list(IMAGE_SIZE),
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,
+                    "stochastic_depth": args.stochastic_depth,
+                    "warmup_epochs": args.warmup_epochs,
+                    "gradient_clip": args.gradient_clip,
+                    "early_stopping_start_epoch": (
+                        args.early_stopping_start_epoch
+                    ),
                     "early_stopping_patience": EARLY_STOPPING_PATIENCE,
                     "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
                     "seed": args.seed,
