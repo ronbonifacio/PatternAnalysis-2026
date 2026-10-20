@@ -1,31 +1,35 @@
 # ADNI ConvNeXt-Tiny classifier
 
 This project uses a layer-by-layer PyTorch implementation of ConvNeXt-Tiny to
-classify ADNI MRI subjects as Alzheimer's disease (AD) or normal control (NC).
-The architecture follows the official TorchVision implementation but does not
-instantiate a prebuilt model or use pretrained weights.
+classify individual ADNI MRI slices as Alzheimer's disease (AD) or normal
+control (NC). It follows the official TorchVision architecture without
+instantiating a prebuilt model or using pretrained weights.
 
-Each subject contains multiple 2D MRI slices. The selected slices are passed
-through the same ConvNeXt encoder independently, producing a 768-dimensional
-feature vector for every slice. The vectors belonging to one subject are then
-averaged and passed to a two-class linear classifier. This produces one AD/NC
-prediction per subject rather than one prediction per slice.
+## Superseded subject-level experiment
 
-TorchVision's standard ConvNeXt only performs spatial average pooling within
-each image. This project retains that operation and adds a second averaging
-step across the slices of each subject, matching the approach used by the basic
-CNN classifier.
+The first model averaged features from 12 slices to make one prediction per
+subject. It stopped at epoch 24 with a best validation accuracy of 59.07%, well
+below the 80% target, so this design was superseded. Its dataset, model and
+training code remain in the three `*_subject_level_superseded.py` files.
 
-The local implementation uses the ConvNeXt-Tiny stage depths `(3, 3, 9, 3)`
-and channel sizes `(96, 192, 384, 768)`. With the original 1000-class head, its
-parameter count matches TorchVision ConvNeXt-Tiny at 28,589,128 parameters.
+## Subject-safe slice classification
+
+The active data loader groups filenames by subject before making the 80/20
+training and validation split. It then flattens each subset into individual
+slices, ensuring similar slices from one subject cannot cross the split.
+ConvNeXt receives one 224×224 slice and returns one AD/NC prediction, with no
+cross-slice averaging. Test accuracy and the confusion matrix are calculated
+over the 9,000 test slices.
+
+The ConvNeXt-Tiny stages use depths `(3, 3, 9, 3)` and channels
+`(96, 192, 384, 768)`. Its original 1000-class parameter count matches
+TorchVision at 28,589,128 parameters.
 
 ## Early stopping
 
-Training monitors validation loss and saves the model whenever the loss
-decreases by at least `0.001`. The patience counter is reset after each such
-improvement. Training stops after five consecutive epochs without this minimum
-improvement, and the best saved weights are used for final test inference.
+Training saves the model when validation loss improves by at least `0.001` and
+stops after five consecutive epochs without that improvement. Final test
+inference uses the best saved weights.
 
 ## References
 

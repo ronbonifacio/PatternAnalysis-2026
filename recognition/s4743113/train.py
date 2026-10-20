@@ -1,14 +1,10 @@
 # Prompt:
-# "Create a train.py which implements our modules.py to train our convnext
-# model. Save model weights to output. Ensure epochs and metrics are reported
-# after each epoch similarly to the basic CNN. Implement early stopping with a
-# patience of 5 epochs and a minimum delta of 0.001 on the validation loss. At
-# the end of training perform inference on the test set and report metrics and
-# confusion matrix similarly to within the basic CNN notebook. Add this prompt
-# as a comment to the top of the script. Document our chosen implementation of
-# early stopping in the next section of the README.md."
+# "Train the layer-by-layer convnext model on individual ADNI MRI slices while
+# splitting training and validation at subject level. Save model weights and
+# report slice-level epoch metrics, test metrics, and a confusion matrix. Use
+# early stopping with patience 5 and a minimum validation-loss delta of 0.001."
 
-"""Train and evaluate the subject-level ConvNeXt-Tiny classifier."""
+"""Train and evaluate the slice-level ConvNeXt-Tiny classifier."""
 
 from __future__ import annotations
 
@@ -20,16 +16,16 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.utils.data import DataLoader
 
-from dataset import create_adni_dataloaders, set_seed
-from modules import SubjectConvNeXt
+from dataset import ADNISliceDataset, create_adni_slice_dataloaders, set_seed
+from modules import ConvNeXt, convnext_tiny
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = SCRIPT_DIR / "ADNI" / "AD_NC"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_slice_level"
 
 IMAGE_SIZE = (224, 224)
 EARLY_STOPPING_PATIENCE = 5
@@ -45,6 +41,7 @@ class EpochMetrics:
 @dataclass(frozen=True)
 class TestResult:
     sample_id: str
+    slice_index: int
     target: int
     prediction: int
     ad_probability: float
@@ -52,13 +49,12 @@ class TestResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ConvNeXt-Tiny on grouped ADNI MRI slices."
+        description="Train ConvNeXt-Tiny on individual ADNI MRI slices."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--max-slices", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=48)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
@@ -76,8 +72,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
-    if args.max_slices <= 0:
-        parser.error("--max-slices must be positive")
     if args.learning_rate <= 0:
         parser.error("--learning-rate must be positive")
     if args.weight_decay < 0:
@@ -88,45 +82,16 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def pack_evenly_spaced_slices(
-    images: Tensor,
-    slice_mask: Tensor,
-    max_slices: int,
-) -> tuple[Tensor, list[int]]:
-    """Select and pack evenly spaced valid slices from every subject."""
-
-    packed_slices: list[Tensor] = []
-    slice_counts: list[int] = []
-
-    for subject_images, subject_mask in zip(images, slice_mask):
-        valid_images = subject_images[subject_mask]
-        count = min(len(valid_images), max_slices)
-        if count == 0:
-            raise ValueError("A subject has no valid slices")
-
-        indices = torch.linspace(
-            0,
-            len(valid_images) - 1,
-            steps=count,
-            device=valid_images.device,
-        ).round().long()
-        packed_slices.append(valid_images[indices])
-        slice_counts.append(count)
-
-    return torch.cat(packed_slices, dim=0), slice_counts
-
-
 def run_epoch(
-    model: SubjectConvNeXt,
+    model: ConvNeXt,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    max_slices: int,
     *,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
 ) -> EpochMetrics:
-    """Run one training or validation epoch and return subject-level metrics."""
+    """Run one training or validation epoch and return slice-level metrics."""
 
     is_training = optimizer is not None
     model.train(is_training)
@@ -134,14 +99,11 @@ def run_epoch(
 
     total_loss = 0.0
     total_correct = 0
-    total_subjects = 0
+    total_slices = 0
 
     for batch in loader:
-        packed_slices, slice_counts = pack_evenly_spaced_slices(
-            batch["images"], batch["slice_mask"], max_slices
-        )
-        packed_slices = packed_slices.to(device, non_blocking=use_amp)
-        labels = batch["labels"].to(device, non_blocking=use_amp)
+        images = batch["image"].to(device, non_blocking=use_amp)
+        labels = batch["label"].to(device, non_blocking=use_amp)
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -152,7 +114,7 @@ def run_epoch(
                 dtype=torch.float16,
                 enabled=use_amp,
             ):
-                logits = model(packed_slices, slice_counts)
+                logits = model(images)
                 loss = criterion(logits, labels)
 
             if is_training:
@@ -164,77 +126,75 @@ def run_epoch(
                     scaler.step(optimizer)
                     scaler.update()
 
-        subject_count = labels.size(0)
-        total_loss += loss.detach().item() * subject_count
+        slice_count = labels.size(0)
+        total_loss += loss.detach().item() * slice_count
         total_correct += (logits.argmax(dim=1) == labels).sum().item()
-        total_subjects += subject_count
+        total_slices += slice_count
 
-    if total_subjects == 0:
-        raise RuntimeError("The data loader produced no subjects")
+    if total_slices == 0:
+        raise RuntimeError("The data loader produced no slices")
 
     return EpochMetrics(
-        loss=total_loss / total_subjects,
-        accuracy=total_correct / total_subjects,
+        loss=total_loss / total_slices,
+        accuracy=total_correct / total_slices,
     )
 
 
 def infer_test_set(
-    model: SubjectConvNeXt,
+    model: ConvNeXt,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    max_slices: int,
     ad_index: int,
 ) -> tuple[float, list[TestResult]]:
-    """Run subject-level test inference and retain per-subject results."""
+    """Run slice-level test inference and retain per-slice results."""
 
     model.eval()
     use_amp = device.type == "cuda"
     total_loss = 0.0
-    total_subjects = 0
+    total_slices = 0
     results: list[TestResult] = []
 
     with torch.inference_mode():
         for batch in loader:
-            packed_slices, slice_counts = pack_evenly_spaced_slices(
-                batch["images"], batch["slice_mask"], max_slices
-            )
-            packed_slices = packed_slices.to(device, non_blocking=use_amp)
-            labels = batch["labels"].to(device, non_blocking=use_amp)
+            images = batch["image"].to(device, non_blocking=use_amp)
+            labels = batch["label"].to(device, non_blocking=use_amp)
 
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.float16,
                 enabled=use_amp,
             ):
-                logits = model(packed_slices, slice_counts)
+                logits = model(images)
                 loss = criterion(logits, labels)
 
             probabilities = logits.softmax(dim=1).float().cpu()
             predictions = probabilities.argmax(dim=1)
-            subject_count = labels.size(0)
-            total_loss += loss.item() * subject_count
-            total_subjects += subject_count
+            slice_count = labels.size(0)
+            total_loss += loss.item() * slice_count
+            total_slices += slice_count
 
-            for sample_id, target, prediction, probability in zip(
-                batch["sample_ids"],
-                batch["labels"],
+            for sample_id, slice_index, target, prediction, probability in zip(
+                batch["sample_id"],
+                batch["slice_index"],
+                batch["label"],
                 predictions,
                 probabilities,
             ):
                 results.append(
                     TestResult(
                         sample_id=str(sample_id),
+                        slice_index=int(slice_index.item()),
                         target=int(target.item()),
                         prediction=int(prediction.item()),
                         ad_probability=float(probability[ad_index].item()),
                     )
                 )
 
-    if total_subjects == 0:
-        raise RuntimeError("The test loader produced no subjects")
+    if total_slices == 0:
+        raise RuntimeError("The test loader produced no slices")
 
-    return total_loss / total_subjects, results
+    return total_loss / total_slices, results
 
 
 def safe_divide(numerator: int, denominator: int) -> float:
@@ -254,7 +214,7 @@ def print_examples(
 
     for result in examples[:limit]:
         print(
-            f"  {result.sample_id}: "
+            f"  {result.sample_id}_{result.slice_index}: "
             f"actual={idx_to_class[result.target]}, "
             f"predicted={idx_to_class[result.prediction]}, "
             f"P(AD)={result.ad_probability:.3f}"
@@ -270,7 +230,7 @@ def report_test_results(
     idx_to_class: dict[int, str],
     output_dir: Path,
 ) -> dict[str, Any]:
-    """Print test metrics and save a labelled confusion-matrix figure."""
+    """Print slice-level test metrics and save a confusion-matrix figure."""
 
     # Use a non-interactive backend and keep Matplotlib's generated cache with
     # the other ignored training outputs rather than in the user's home folder.
@@ -316,14 +276,14 @@ def report_test_results(
     recall = safe_divide(true_positives, true_positives + false_negatives)
     f1 = safe_divide(2 * precision * recall, precision + recall)
 
-    print("\nTest results (AD is the positive class)")
+    print("\nSlice-level test results (AD is the positive class)")
     print(f"Loss:      {test_loss:.4f}")
     print(f"Accuracy:  {accuracy:.2%} ({len(correct)}/{len(results)})")
     print(f"Precision: {precision:.2%}")
     print(f"Recall:    {recall:.2%}")
     print(f"F1 score:  {f1:.2%}")
 
-    print("\nTest confusion matrix")
+    print("\nSlice-level test confusion matrix")
     print("                    Predicted NC  Predicted AD")
     print(f"Actual NC (negative) {true_negatives:12d} {false_positives:13d}")
     print(f"Actual AD (positive) {false_negatives:12d} {true_positives:13d}")
@@ -353,7 +313,7 @@ def report_test_results(
     heatmap = axis.imshow(confusion_matrix, cmap="Blues")
     axis.set_xticks([0, 1], labels=["Predicted NC", "Predicted AD"])
     axis.set_yticks([0, 1], labels=["Actual NC", "Actual AD"])
-    axis.set_title("AD vs NC Test Confusion Matrix")
+    axis.set_title("AD vs NC Slice-Level Test Confusion Matrix")
 
     threshold = max(max(row) for row in confusion_matrix) / 2
     for row in range(2):
@@ -373,7 +333,7 @@ def report_test_results(
                 ),
             )
 
-    figure.colorbar(heatmap, ax=axis, label="Subjects")
+    figure.colorbar(heatmap, ax=axis, label="Slices")
     figure.text(
         0.5,
         0.01,
@@ -416,7 +376,7 @@ def main() -> None:
     last_weights_path = args.output_dir / "last_model_weights.pt"
     metrics_path = args.output_dir / "metrics.json"
 
-    train_loader, validation_loader, test_loader = create_adni_dataloaders(
+    train_loader, validation_loader, test_loader = create_adni_slice_dataloaders(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         validation_fraction=args.validation_fraction,
@@ -426,7 +386,9 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    training_dataset = train_loader.dataset.dataset
+    training_dataset = train_loader.dataset
+    if not isinstance(training_dataset, ADNISliceDataset):
+        raise TypeError("Expected an ADNISliceDataset")
     class_to_idx = dict(training_dataset.class_to_idx)
     if "AD" not in class_to_idx or "NC" not in class_to_idx:
         raise ValueError("The dataset must contain AD and NC classes")
@@ -434,7 +396,7 @@ def main() -> None:
     ad_index = class_to_idx["AD"]
     nc_index = class_to_idx["NC"]
 
-    model = SubjectConvNeXt(num_classes=len(class_to_idx)).to(device)
+    model = convnext_tiny(num_classes=len(class_to_idx)).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -448,10 +410,12 @@ def main() -> None:
     )
     print(f"Device: {device}")
     print(f"Classes: {class_to_idx}")
-    print(f"Training subjects: {len(train_loader.dataset)}")
-    print(f"Validation subjects: {len(validation_loader.dataset)}")
-    print(f"Test subjects: {len(test_loader.dataset)}")
-    print(f"Selected slices per subject: at most {args.max_slices}")
+    print(f"Training subjects: {training_dataset.subject_count}")
+    print(f"Validation subjects: {validation_loader.dataset.subject_count}")
+    print(f"Test subjects: {test_loader.dataset.subject_count}")
+    print(f"Training slices: {len(training_dataset)}")
+    print(f"Validation slices: {len(validation_loader.dataset)}")
+    print(f"Test slices: {len(test_loader.dataset)}")
     print(f"Trainable parameters: {trainable_parameters:,}")
 
     best_validation_loss = float("inf")
@@ -465,7 +429,6 @@ def main() -> None:
             train_loader,
             criterion,
             device,
-            args.max_slices,
             optimizer=optimizer,
             scaler=scaler,
         )
@@ -474,7 +437,6 @@ def main() -> None:
             validation_loader,
             criterion,
             device,
-            args.max_slices,
         )
 
         history.append(
@@ -532,7 +494,6 @@ def main() -> None:
         test_loader,
         criterion,
         device,
-        args.max_slices,
         ad_index,
     )
     test_metrics = report_test_results(
@@ -550,7 +511,6 @@ def main() -> None:
                 "configuration": {
                     "epochs_requested": args.epochs,
                     "batch_size": args.batch_size,
-                    "max_slices": args.max_slices,
                     "image_size": list(IMAGE_SIZE),
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,

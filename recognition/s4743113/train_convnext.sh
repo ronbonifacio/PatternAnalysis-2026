@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=convnext-adni
+#SBATCH --job-name=convnext-slice
 #SBATCH --partition=comp3710
 #SBATCH --account=comp3710
 #SBATCH --gres=gpu
 #SBATCH --cpus-per-task=8
-#SBATCH --time=02:00:00
-#SBATCH --output=convnext_adni_%j.out
-#SBATCH --error=convnext_adni_%j.err
+#SBATCH --time=03:00:00
+#SBATCH --output=convnext_slice_%j.out
+#SBATCH --error=convnext_slice_%j.err
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ else
 fi
 
 cd "${train_dir}"
-mkdir -p output/convnext_tiny
+mkdir -p output/convnext_tiny_slice_level
 
 echo "SLURM job: ${SLURM_JOB_ID:-not available}"
 echo "Host: $(hostname)"
