@@ -3,3 +3,4 @@ __pycache__/
 
 /ADNI/*
 *.pt
+/output/convnext_tiny/

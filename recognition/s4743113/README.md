@@ -20,6 +20,13 @@ The local implementation uses the ConvNeXt-Tiny stage depths `(3, 3, 9, 3)`
 and channel sizes `(96, 192, 384, 768)`. With the original 1000-class head, its
 parameter count matches TorchVision ConvNeXt-Tiny at 28,589,128 parameters.
 
+## Early stopping
+
+Training monitors validation loss and saves the model whenever the loss
+decreases by at least `0.001`. The patience counter is reset after each such
+improvement. Training stops after five consecutive epochs without this minimum
+improvement, and the best saved weights are used for final test inference.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
