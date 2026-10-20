@@ -2,7 +2,7 @@
 # "Train the layer-by-layer convnext model on individual ADNI MRI slices while
 # splitting training and validation at subject level. Save model weights and
 # report slice-level epoch metrics, test metrics, and a confusion matrix. Use
-# early stopping with patience 5 and a minimum validation-loss delta of 0.001."
+# early stopping with patience 20 and a minimum validation-loss delta of 0.0001."
 
 """Train and evaluate the slice-level ConvNeXt-Tiny classifier."""
 
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -29,8 +28,8 @@ DEFAULT_DATA_DIR = SCRIPT_DIR / "ADNI" / "AD_NC"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_slice_level"
 
 IMAGE_SIZE = (224, 224)
-EARLY_STOPPING_PATIENCE = 5
-EARLY_STOPPING_MIN_DELTA = 0.001
+EARLY_STOPPING_PATIENCE = 20
+EARLY_STOPPING_MIN_DELTA = 0.0001
 DEFAULT_EARLY_STOPPING_START_EPOCH = 10
 DEFAULT_WARMUP_EPOCHS = 5
 DEFAULT_GRADIENT_CLIP = 1.0
@@ -59,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=48)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
@@ -176,20 +175,14 @@ def create_learning_rate_scheduler(
     total_epochs: int,
     warmup_epochs: int,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Warm up linearly, then decay the learning rate with a cosine curve."""
+    """Warm up linearly, then keep the base learning rate constant."""
 
     warmup_epochs = min(warmup_epochs, total_epochs)
 
     def learning_rate_multiplier(epoch_index: int) -> float:
         if warmup_epochs and epoch_index < warmup_epochs:
             return (epoch_index + 1) / warmup_epochs
-
-        cosine_steps = max(total_epochs - warmup_epochs - 1, 1)
-        progress = min(
-            max(epoch_index - warmup_epochs, 0) / cosine_steps,
-            1.0,
-        )
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0
 
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer,
