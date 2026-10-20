@@ -33,6 +33,9 @@ EARLY_STOPPING_MIN_DELTA = 0.0001
 DEFAULT_EARLY_STOPPING_START_EPOCH = 10
 DEFAULT_WARMUP_EPOCHS = 5
 DEFAULT_GRADIENT_CLIP = 1.0
+PLATEAU_PATIENCE = 5
+PLATEAU_FACTOR = 0.5
+PLATEAU_MIN_LR = 1e-6
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=48)
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
@@ -169,13 +172,13 @@ def run_epoch(
     )
 
 
-def create_learning_rate_scheduler(
+def create_warmup_scheduler(
     optimizer: torch.optim.Optimizer,
     *,
     total_epochs: int,
     warmup_epochs: int,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Warm up linearly, then keep the base learning rate constant."""
+    """Warm up linearly to the optimizer's base learning rate."""
 
     warmup_epochs = min(warmup_epochs, total_epochs)
 
@@ -456,10 +459,19 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    scheduler = create_learning_rate_scheduler(
+    warmup_scheduler = create_warmup_scheduler(
         optimizer,
         total_epochs=args.epochs,
         warmup_epochs=args.warmup_epochs,
+    )
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=PLATEAU_FACTOR,
+        patience=PLATEAU_PATIENCE,
+        threshold=EARLY_STOPPING_MIN_DELTA,
+        threshold_mode="abs",
+        min_lr=PLATEAU_MIN_LR,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
@@ -479,6 +491,10 @@ def main() -> None:
         f"Base learning rate: {args.learning_rate:g}; "
         f"warm-up epochs: {args.warmup_epochs}; "
         f"weight decay: {args.weight_decay:g}"
+    )
+    print(
+        f"Plateau scheduler: factor {PLATEAU_FACTOR:g}, patience "
+        f"{PLATEAU_PATIENCE}, minimum learning rate {PLATEAU_MIN_LR:g}"
     )
     print(
         f"Stochastic depth: {args.stochastic_depth:g}; "
@@ -554,15 +570,27 @@ def main() -> None:
                 epochs_without_improvement += 1
                 print(
                     f"  No validation-loss improvement of at least "
-                    f"{EARLY_STOPPING_MIN_DELTA:.3f} "
+                    f"{EARLY_STOPPING_MIN_DELTA:g} "
                     f"({epochs_without_improvement}/{EARLY_STOPPING_PATIENCE})"
                 )
 
-        scheduler.step()
+        learning_rate_before_step = optimizer.param_groups[0]["lr"]
+        if epoch < min(args.warmup_epochs, args.epochs):
+            warmup_scheduler.step()
+        else:
+            plateau_scheduler.step(validation_metrics.loss)
+        learning_rate_after_step = optimizer.param_groups[0]["lr"]
+        if learning_rate_after_step < learning_rate_before_step:
+            print(
+                f"  Plateau scheduler reduced learning rate from "
+                f"{learning_rate_before_step:.2e} to "
+                f"{learning_rate_after_step:.2e}."
+            )
+
         if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
             print(
                 f"Early stopping after epoch {epoch}: validation loss did not "
-                f"improve by at least {EARLY_STOPPING_MIN_DELTA:.3f} for "
+                f"improve by at least {EARLY_STOPPING_MIN_DELTA:g} for "
                 f"{EARLY_STOPPING_PATIENCE} consecutive epochs."
             )
             break
@@ -602,6 +630,9 @@ def main() -> None:
                     "weight_decay": args.weight_decay,
                     "stochastic_depth": args.stochastic_depth,
                     "warmup_epochs": args.warmup_epochs,
+                    "plateau_patience": PLATEAU_PATIENCE,
+                    "plateau_factor": PLATEAU_FACTOR,
+                    "plateau_min_lr": PLATEAU_MIN_LR,
                     "gradient_clip": args.gradient_clip,
                     "early_stopping_start_epoch": (
                         args.early_stopping_start_epoch
