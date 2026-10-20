@@ -27,17 +27,24 @@ TorchVision at 28,589,128 parameters.
 
 ## Training setup
 
-AdamW uses a base learning rate of `0.0003` and weight decay of `0.01`.
-Training linearly warms up for five epochs, then follows cosine learning-rate
-decay. Stochastic depth is disabled and gradients are clipped to `1.0` to make
-training more stable.
+AdamW uses a base learning rate of `0.00005` and weight decay of `0.01`.
+Training linearly warms up for five epochs, then keeps the learning rate
+constant. Stochastic depth is disabled and gradients are clipped to `1.0` to
+make training more stable.
 
 ## Early stopping
 
-Training saves the model when validation loss improves by at least `0.001` and
-stops after five consecutive epochs without that improvement. Counting begins
+Training saves the model when validation loss improves by at least `0.0001` and
+stops after 20 consecutive epochs without that improvement. Counting begins
 after epoch 10 so the warm-up and initial learning period cannot stop training
 prematurely. Final test inference uses the best saved weights.
+
+## Hyperparameter changes
+
+- Reduced the learning rate from `0.0003` to `0.00005`.
+- Removed cosine decay, keeping the learning rate constant after warm-up.
+- Increased early-stopping patience from 5 to 20 epochs.
+- Reduced the minimum validation-loss improvement from `0.001` to `0.0001`.
 
 ## References
 
