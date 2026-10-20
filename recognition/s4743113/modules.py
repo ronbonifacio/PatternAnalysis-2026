@@ -1,22 +1,24 @@
-# Propt:
+# Prompt:
 # Convert the official TorchVision ConvNeXt-Tiny source into a standalone,
-# layer-by-layer PyTorch implementation without using the prebuilt model.
-# Adapt it to the dataloader by encoding each 2D slice, grouping the slice
-# features by subject, averaging them in the same way as the basic CNN
-# classifier, and producing one AD/NC prediction per subject. Keep attribution
-# to the ConvNeXt paper and TorchVision source.
+# layer-by-layer PyTorch implementation without using the prebuilt model. Use
+# it to classify each 2D ADNI slice independently while keeping subjects intact
+# when the data is split. Keep attribution to the ConvNeXt paper and
+# TorchVision source.
+#
+# Superseded prompt from the first experiment:
+# Adapt the model by grouping each subject's slice features, averaging them as
+# in the basic CNN classifier, and producing one prediction per subject.
 
-"""Standalone ConvNeXt modules for subject-level ADNI classification.
+"""Standalone ConvNeXt modules for slice-level ADNI classification.
 
 The architecture follows ConvNeXt-Tiny from "A ConvNet for the 2020s" and the
 TorchVision reference implementation, but is assembled here from PyTorch
 layers instead of calling a prebuilt model.
 
-TorchVision's ordinary ConvNeXt forward pass accepts independent images and
-produces one prediction per image. ``SubjectConvNeXt`` adds a second level of
-pooling for this project: ConvNeXt first spatially pools each MRI slice into a
-768-value feature vector, then the wrapper averages those vectors across the
-slices belonging to one subject and produces one prediction for that subject.
+The active model follows TorchVision's ordinary forward pass: it accepts a
+batch of independent 2D MRI slices and produces one AD/NC prediction per
+slice. The earlier mean-pooling model is preserved separately in
+``modules_subject_level_superseded.py``.
 
 References:
     https://arxiv.org/abs/2201.03545
@@ -39,7 +41,6 @@ __all__ = [
     "CNBlockConfig",
     "ConvNeXt",
     "LayerNorm2d",
-    "SubjectConvNeXt",
     "convnext_tiny",
 ]
 
@@ -245,55 +246,3 @@ def convnext_tiny(
         stochastic_depth_probability=stochastic_depth_probability,
         num_classes=num_classes,
     )
-
-
-class SubjectConvNeXt(nn.Module):
-    """Classify subjects by mean-pooling their ConvNeXt slice features.
-
-    This wrapper is the project-specific difference from TorchVision's image
-    classifier. ``packed_slices`` holds the selected slices from every subject
-    as one efficient image batch. ``slice_counts`` records where each subject's
-    slices end. After ConvNeXt encodes every slice independently, the features
-    are split back into subjects and averaged feature-by-feature. The operation
-    matches the subject pooling used by the basic CNN classifier.
-
-    For four subjects with 12 slices each, the shapes are::
-
-        packed slices:    [48, 3, 224, 224]
-        slice features:   [48, 768]
-        subject features: [4, 768]
-        output logits:    [4, num_classes]
-
-    The slice mean gives every selected slice equal influence and discards
-    slice order. It is separate from ConvNeXt's spatial average pooling.
-    """
-
-    def __init__(self, num_classes: int = 2) -> None:
-        super().__init__()
-        self.backbone = convnext_tiny(num_classes=num_classes)
-
-    def forward(
-        self,
-        packed_slices: Tensor,
-        slice_counts: Sequence[int],
-    ) -> Tensor:
-        if packed_slices.ndim != 4:
-            raise ValueError("packed_slices must have shape [slices, C, H, W]")
-
-        counts = tuple(int(count) for count in slice_counts)
-        if not counts or any(count <= 0 for count in counts):
-            raise ValueError("slice_counts must contain positive integers")
-        if sum(counts) != packed_slices.shape[0]:
-            raise ValueError("slice_counts must sum to the number of packed slices")
-
-        # ConvNeXt handles the packed tensor as independent 2D images. Unlike
-        # the standard TorchVision forward pass, classification is deliberately
-        # delayed until after the images have been regrouped into subjects.
-        slice_features = self.backbone.forward_features(packed_slices)
-
-        # Example for counts (12, 12, 12, 12): split [48, 768] into four
-        # [12, 768] tensors, then mean(dim=0) makes four [768] subject vectors.
-        subject_features = torch.stack(
-            [features.mean(dim=0) for features in torch.split(slice_features, counts)]
-        )
-        return self.backbone.classifier(subject_features)

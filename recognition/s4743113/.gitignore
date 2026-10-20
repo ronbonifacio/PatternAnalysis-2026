@@ -3,3 +3,5 @@ __pycache__/
 
 /ADNI/*
 /output/convnext_tiny/
+/output/convnext_tiny_slice_level/
+/output/convnext_tiny_subject_superseded/

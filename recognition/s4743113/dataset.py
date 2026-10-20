@@ -28,7 +28,7 @@ from typing import Callable, Mapping, Sequence
 import torch
 from PIL import Image
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 
 _SLICE_NAME = re.compile(r"^(?P<sample>.+)_(?P<slice>\d+)$")
@@ -43,6 +43,16 @@ class ADNISample:
     label: int
     slice_paths: tuple[Path, ...]
     slice_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ADNISlice:
+    """One labelled MRI slice belonging to an ADNI sample."""
+
+    sample_id: str
+    label: int
+    path: Path
+    slice_index: int
 
 
 def set_seed(seed: int) -> None:
@@ -99,20 +109,8 @@ def _image_to_tensor(
     return pixels.permute(2, 0, 1).contiguous().float().div_(255.0)
 
 
-class ADNIDataset(Dataset[dict[str, object]]):
-    """A dataset where all JPEG slices for a subject are one item.
-
-    Each item is a dictionary containing:
-
-    - ``images``: ``[slices, 3, height, width]`` float tensor
-    - ``label``: integer class index
-    - ``sample_id``: filename prefix preceding the final ``_<slice>``
-    - ``slice_indices``: the numeric suffixes, in ascending order
-
-    ``transform`` receives the complete stacked slice tensor, so random spatial
-    transforms can be applied consistently to the sample rather than choosing
-    a different transform for every slice.
-    """
+class ADNISubjectIndex:
+    """Index slice paths by subject before creating slice datasets."""
 
     def __init__(
         self,
@@ -120,11 +118,9 @@ class ADNIDataset(Dataset[dict[str, object]]):
         *,
         class_to_idx: Mapping[str, int] | None = None,
         image_size: tuple[int, int] | None = (224, 224),
-        transform: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
         self.split_dir = Path(split_dir)
         self.image_size = image_size
-        self.transform = transform
 
         if not self.split_dir.is_dir():
             raise FileNotFoundError(f"Dataset split does not exist: {self.split_dir}")
@@ -207,73 +203,89 @@ class ADNIDataset(Dataset[dict[str, object]]):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> dict[str, object]:
-        sample = self.samples[index]
-        images = torch.stack(
-            [_image_to_tensor(path, self.image_size) for path in sample.slice_paths]
+
+class ADNISliceDataset(Dataset[dict[str, object]]):
+    """Expose slices from selected subjects as independent examples.
+
+    Subject indices are chosen before this dataset is created. Therefore,
+    flattening the selected subjects into slices cannot place neighbouring
+    slices from one subject in both the training and validation subsets.
+    """
+
+    def __init__(
+        self,
+        subject_dataset: ADNISubjectIndex,
+        subject_indices: Sequence[int] | None = None,
+        *,
+        transform: Callable[[Tensor], Tensor] | None = None,
+    ) -> None:
+        self.class_to_idx = dict(subject_dataset.class_to_idx)
+        self.image_size = subject_dataset.image_size
+        self.transform = transform
+
+        if subject_indices is None:
+            selected_indices = tuple(range(len(subject_dataset)))
+        else:
+            selected_indices = tuple(int(index) for index in subject_indices)
+
+        if len(selected_indices) != len(set(selected_indices)):
+            raise ValueError("subject_indices contains duplicate indices")
+        if any(index < 0 or index >= len(subject_dataset) for index in selected_indices):
+            raise IndexError("subject index is outside the dataset")
+
+        self.subject_ids = tuple(
+            subject_dataset.samples[index].sample_id for index in selected_indices
         )
+        self.slices: list[ADNISlice] = []
+        for subject_index in selected_indices:
+            sample = subject_dataset.samples[subject_index]
+            self.slices.extend(
+                ADNISlice(
+                    sample_id=sample.sample_id,
+                    label=sample.label,
+                    path=path,
+                    slice_index=slice_index,
+                )
+                for path, slice_index in zip(
+                    sample.slice_paths,
+                    sample.slice_indices,
+                )
+            )
+
+    @property
+    def classes(self) -> list[str]:
+        """Class names ordered by their integer label."""
+
+        ordered_classes = sorted(
+            self.class_to_idx.items(), key=lambda item: item[1]
+        )
+        return [name for name, _ in ordered_classes]
+
+    @property
+    def subject_count(self) -> int:
+        return len(self.subject_ids)
+
+    def __len__(self) -> int:
+        return len(self.slices)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        item = self.slices[index]
+        image = _image_to_tensor(item.path, self.image_size)
         if self.transform is not None:
-            images = self.transform(images)
+            image = self.transform(image)
 
         return {
-            "images": images,
-            "label": sample.label,
-            "sample_id": sample.sample_id,
-            "slice_indices": sample.slice_indices,
+            "image": image,
+            "label": item.label,
+            "sample_id": item.sample_id,
+            "slice_index": item.slice_index,
         }
 
 
-def collate_adni_samples(
-    items: Sequence[dict[str, object]],
-) -> dict[str, object]:
-    """Pad samples to the largest slice count in a mini-batch.
-
-    ``slice_mask[b, s]`` is true when ``images[b, s]`` is a real slice and
-    false for padding.  A model can use this mask when pooling over slices.
-    """
-
-    if not items:
-        raise ValueError("Cannot collate an empty batch")
-
-    image_tensors = [item["images"] for item in items]
-    if not all(
-        isinstance(images, Tensor) and images.ndim == 4
-        for images in image_tensors
-    ):
-        raise TypeError("Every item must contain a 4D 'images' tensor")
-
-    images = [tensor for tensor in image_tensors if isinstance(tensor, Tensor)]
-    max_slices = max(tensor.shape[0] for tensor in images)
-    spatial_shapes = {tuple(tensor.shape[1:]) for tensor in images}
-    if len(spatial_shapes) != 1:
-        raise ValueError(
-            "All images in a batch must have the same channel and spatial dimensions. "
-            "Pass a fixed image_size or a resizing transform."
-        )
-
-    batch_shape = (len(images), max_slices, *images[0].shape[1:])
-    batch = images[0].new_zeros(batch_shape)
-    slice_mask = torch.zeros((len(images), max_slices), dtype=torch.bool)
-    for batch_index, tensor in enumerate(images):
-        slice_count = tensor.shape[0]
-        batch[batch_index, :slice_count] = tensor
-        slice_mask[batch_index, :slice_count] = True
-
-    return {
-        "images": batch,
-        "labels": torch.tensor(
-            [int(item["label"]) for item in items], dtype=torch.long
-        ),
-        "slice_mask": slice_mask,
-        "sample_ids": [str(item["sample_id"]) for item in items],
-        "slice_indices": [item["slice_indices"] for item in items],
-    }
-
-
-def create_adni_dataloaders(
+def create_adni_slice_dataloaders(
     data_dir: str | Path | None = None,
     *,
-    batch_size: int = 8,
+    batch_size: int = 48,
     validation_fraction: float = 0.2,
     seed: int = 42,
     image_size: tuple[int, int] | None = (224, 224),
@@ -282,10 +294,13 @@ def create_adni_dataloaders(
     num_workers: int = 0,
     pin_memory: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Create deterministic 80/20 train/validation and test loaders.
+    """Create slice loaders after a deterministic subject-level split.
 
-    The split happens after slices have been grouped, so every slice belonging
-    to a sample is guaranteed to remain in the same subset.
+    Training subjects are split 80/20 before their records are flattened into
+    individual slices. All slices from a subject therefore stay entirely in
+    either training or validation, while ConvNeXt still receives one 2D slice
+    and one label for each dataset item. The provided test split is flattened
+    in the same way and remains separate from both subsets.
     """
 
     if batch_size <= 0:
@@ -296,9 +311,6 @@ def create_adni_dataloaders(
         raise ValueError("num_workers cannot be negative")
 
     set_seed(seed)
-    # Anchor the default to this source file, not to whichever directory was
-    # active when Python/Jupyter was launched.  This remains portable if the
-    # whole s4743113 directory is moved.
     data_path = (
         Path(__file__).resolve().parent / "data"
         if data_dir is None
@@ -309,44 +321,54 @@ def create_adni_dataloaders(
 
     train_dir = _find_split_directory(data_path, ("train", "training"))
     test_dir = _find_split_directory(data_path, ("test", "testing"))
-
-    # Validation must not receive random training augmentation.  The two
-    # datasets have identical ordering, so the same generated indices can be
-    # applied to each view.
-    training_dataset = ADNIDataset(
-        train_dir, image_size=image_size, transform=train_transform
-    )
-    validation_dataset = ADNIDataset(
-        train_dir,
-        class_to_idx=training_dataset.class_to_idx,
-        image_size=image_size,
-        transform=evaluation_transform,
-    )
-    test_dataset = ADNIDataset(
+    training_subjects = ADNISubjectIndex(train_dir, image_size=image_size)
+    test_subjects = ADNISubjectIndex(
         test_dir,
-        class_to_idx=training_dataset.class_to_idx,
+        class_to_idx=training_subjects.class_to_idx,
         image_size=image_size,
+    )
+
+    training_identities = {
+        (sample.label, sample.sample_id) for sample in training_subjects.samples
+    }
+    test_identities = {
+        (sample.label, sample.sample_id) for sample in test_subjects.samples
+    }
+    if training_identities & test_identities:
+        raise RuntimeError("A subject appears in both the provided train and test splits")
+
+    subject_count = len(training_subjects)
+    if subject_count < 2:
+        raise ValueError("At least two grouped training subjects are required")
+    validation_count = max(1, round(subject_count * validation_fraction))
+    training_count = subject_count - validation_count
+    if training_count == 0:
+        raise ValueError("validation_fraction leaves no subjects for training")
+
+    permutation = torch.randperm(
+        subject_count,
+        generator=torch.Generator().manual_seed(seed),
+    ).tolist()
+    training_indices = permutation[:training_count]
+    validation_indices = permutation[training_count:]
+
+    training_slices = ADNISliceDataset(
+        training_subjects,
+        training_indices,
+        transform=train_transform,
+    )
+    validation_slices = ADNISliceDataset(
+        training_subjects,
+        validation_indices,
+        transform=evaluation_transform,
+    )
+    test_slices = ADNISliceDataset(
+        test_subjects,
         transform=evaluation_transform,
     )
 
-    sample_count = len(training_dataset)
-    if sample_count < 2:
-        raise ValueError("At least two grouped training samples are required")
-    validation_count = max(1, round(sample_count * validation_fraction))
-    training_count = sample_count - validation_count
-    if training_count == 0:
-        raise ValueError("validation_fraction leaves no samples for training")
-
-    split_generator = torch.Generator().manual_seed(seed)
-    training_subset, validation_index_subset = random_split(
-        training_dataset,
-        [training_count, validation_count],
-        generator=split_generator,
-    )
-
-    # Reuse the exact validation indices with the non-augmented dataset view.
-    validation_indices = validation_index_subset.indices
-    validation_subset = torch.utils.data.Subset(validation_dataset, validation_indices)
+    if set(training_slices.subject_ids) & set(validation_slices.subject_ids):
+        raise RuntimeError("A subject appears in both training and validation")
 
     common_loader_options = {
         "batch_size": batch_size,
@@ -354,21 +376,20 @@ def create_adni_dataloaders(
         "pin_memory": pin_memory,
         "persistent_workers": num_workers > 0,
         "worker_init_fn": _seed_worker,
-        "collate_fn": collate_adni_samples,
     }
     train_loader = DataLoader(
-        training_subset,
+        training_slices,
         shuffle=True,
         generator=torch.Generator().manual_seed(seed + 1),
         **common_loader_options,
     )
     validation_loader = DataLoader(
-        validation_subset,
+        validation_slices,
         shuffle=False,
         **common_loader_options,
     )
     test_loader = DataLoader(
-        test_dataset,
+        test_slices,
         shuffle=False,
         **common_loader_options,
     )
