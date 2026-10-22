@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ DEFAULT_GRADIENT_CLIP = 1.0
 PLATEAU_PATIENCE = 5
 PLATEAU_FACTOR = 0.5
 PLATEAU_MIN_LR = 1e-6
+COSINE_MIN_LR = 1e-6
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
+    parser.add_argument(
+        "--learning-rate-scheduler",
+        choices=("plateau", "cosine"),
+        default="plateau",
+    )
+    parser.add_argument("--disable-early-stopping", action="store_true")
     parser.add_argument(
         "--gradient-clip",
         type=float,
@@ -186,6 +194,39 @@ def create_warmup_scheduler(
         if warmup_epochs and epoch_index < warmup_epochs:
             return (epoch_index + 1) / warmup_epochs
         return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        learning_rate_multiplier,
+    )
+
+
+def create_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_epochs: int,
+    warmup_epochs: int,
+    minimum_learning_rate: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warm up linearly, then anneal to a fixed minimum learning rate."""
+
+    warmup_epochs = min(warmup_epochs, total_epochs)
+    base_learning_rate = optimizer.param_groups[0]["lr"]
+    minimum_multiplier = min(minimum_learning_rate / base_learning_rate, 1.0)
+    cosine_epochs = max(total_epochs - warmup_epochs, 1)
+
+    def learning_rate_multiplier(epoch_index: int) -> float:
+        if warmup_epochs and epoch_index < warmup_epochs:
+            return (epoch_index + 1) / warmup_epochs
+        if total_epochs <= warmup_epochs:
+            return 1.0
+
+        progress = min(
+            max(epoch_index - warmup_epochs + 1, 0) / cosine_epochs,
+            1.0,
+        )
+        cosine_value = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return minimum_multiplier + (1.0 - minimum_multiplier) * cosine_value
 
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -459,20 +500,31 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    warmup_scheduler = create_warmup_scheduler(
-        optimizer,
-        total_epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs,
-    )
-    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=PLATEAU_FACTOR,
-        patience=PLATEAU_PATIENCE,
-        threshold=EARLY_STOPPING_MIN_DELTA,
-        threshold_mode="abs",
-        min_lr=PLATEAU_MIN_LR,
-    )
+    warmup_scheduler = None
+    plateau_scheduler = None
+    cosine_scheduler = None
+    if args.learning_rate_scheduler == "plateau":
+        warmup_scheduler = create_warmup_scheduler(
+            optimizer,
+            total_epochs=args.epochs,
+            warmup_epochs=args.warmup_epochs,
+        )
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=PLATEAU_FACTOR,
+            patience=PLATEAU_PATIENCE,
+            threshold=EARLY_STOPPING_MIN_DELTA,
+            threshold_mode="abs",
+            min_lr=PLATEAU_MIN_LR,
+        )
+    else:
+        cosine_scheduler = create_warmup_cosine_scheduler(
+            optimizer,
+            total_epochs=args.epochs,
+            warmup_epochs=args.warmup_epochs,
+            minimum_learning_rate=COSINE_MIN_LR,
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     trainable_parameters = sum(
@@ -497,20 +549,29 @@ def main() -> None:
         f"warm-up epochs: {args.warmup_epochs}; "
         f"weight decay: {args.weight_decay:g}"
     )
-    print(
-        f"Plateau scheduler: factor {PLATEAU_FACTOR:g}, patience "
-        f"{PLATEAU_PATIENCE}, minimum learning rate {PLATEAU_MIN_LR:g}"
-    )
+    if args.learning_rate_scheduler == "plateau":
+        print(
+            f"Plateau scheduler: factor {PLATEAU_FACTOR:g}, patience "
+            f"{PLATEAU_PATIENCE}, minimum learning rate {PLATEAU_MIN_LR:g}"
+        )
+    else:
+        print(
+            f"Cosine scheduler: anneal after warm-up to minimum learning "
+            f"rate {COSINE_MIN_LR:g}"
+        )
     print(
         f"Stochastic depth: {args.stochastic_depth:g}; "
         f"gradient clipping: {args.gradient_clip:g}"
     )
-    print(
-        f"Early stopping: start after epoch "
-        f"{args.early_stopping_start_epoch}, patience "
-        f"{EARLY_STOPPING_PATIENCE}, minimum delta "
-        f"{EARLY_STOPPING_MIN_DELTA:g}"
-    )
+    if args.disable_early_stopping:
+        print(f"Early stopping: disabled; training all {args.epochs} epochs")
+    else:
+        print(
+            f"Early stopping: start after epoch "
+            f"{args.early_stopping_start_epoch}, patience "
+            f"{EARLY_STOPPING_PATIENCE}, minimum delta "
+            f"{EARLY_STOPPING_MIN_DELTA:g}"
+        )
 
     best_validation_loss = float("inf")
     best_epoch = 0
@@ -564,7 +625,13 @@ def main() -> None:
                 f"{best_weights_path}"
             )
         else:
-            if epoch <= args.early_stopping_start_epoch:
+            if args.disable_early_stopping:
+                epochs_without_improvement = 0
+                print(
+                    "  No minimum-delta improvement; fixed-epoch training "
+                    "continues."
+                )
+            elif epoch <= args.early_stopping_start_epoch:
                 epochs_without_improvement = 0
                 print(
                     "  No minimum-delta improvement; early-stopping "
@@ -580,19 +647,30 @@ def main() -> None:
                 )
 
         learning_rate_before_step = optimizer.param_groups[0]["lr"]
-        if epoch < min(args.warmup_epochs, args.epochs):
-            warmup_scheduler.step()
+        if args.learning_rate_scheduler == "cosine":
+            if cosine_scheduler is None:
+                raise RuntimeError("Cosine scheduler was not initialized")
+            cosine_scheduler.step()
         else:
-            plateau_scheduler.step(validation_metrics.loss)
+            if warmup_scheduler is None or plateau_scheduler is None:
+                raise RuntimeError("Plateau schedulers were not initialized")
+            if epoch < min(args.warmup_epochs, args.epochs):
+                warmup_scheduler.step()
+            else:
+                plateau_scheduler.step(validation_metrics.loss)
         learning_rate_after_step = optimizer.param_groups[0]["lr"]
         if learning_rate_after_step < learning_rate_before_step:
-            print(
-                f"  Plateau scheduler reduced learning rate from "
-                f"{learning_rate_before_step:.2e} to "
-                f"{learning_rate_after_step:.2e}."
-            )
+            if args.learning_rate_scheduler == "plateau":
+                print(
+                    f"  Plateau scheduler reduced learning rate from "
+                    f"{learning_rate_before_step:.2e} to "
+                    f"{learning_rate_after_step:.2e}."
+                )
 
-        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+        if (
+            not args.disable_early_stopping
+            and epochs_without_improvement >= EARLY_STOPPING_PATIENCE
+        ):
             print(
                 f"Early stopping after epoch {epoch}: validation loss did not "
                 f"improve by at least {EARLY_STOPPING_MIN_DELTA:g} for "
@@ -636,13 +714,18 @@ def main() -> None:
                         training_dataset.foreground_standard_deviation
                     ),
                     "learning_rate": args.learning_rate,
+                    "learning_rate_scheduler": args.learning_rate_scheduler,
                     "weight_decay": args.weight_decay,
                     "stochastic_depth": args.stochastic_depth,
                     "warmup_epochs": args.warmup_epochs,
                     "plateau_patience": PLATEAU_PATIENCE,
                     "plateau_factor": PLATEAU_FACTOR,
                     "plateau_min_lr": PLATEAU_MIN_LR,
+                    "cosine_min_lr": COSINE_MIN_LR,
                     "gradient_clip": args.gradient_clip,
+                    "early_stopping_enabled": (
+                        not args.disable_early_stopping
+                    ),
                     "early_stopping_start_epoch": (
                         args.early_stopping_start_epoch
                     ),
