@@ -55,6 +55,13 @@ rescaling individual brains. Foreground mean and standard deviation are then
 calculated from training subjects only and reused to normalize training,
 validation and test slices, while black background pixels remain zero.
 
+## Cosine scheduler experiment
+
+`train_cosine.py` provides a separate comparison run using the same model and
+preprocessing. It warms up to `0.0001`, follows cosine annealing down to
+`0.000001`, and completes all 100 epochs without early stopping. Its weights
+and metrics use a separate `output/convnext_tiny_slice_level_cosine` folder.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
