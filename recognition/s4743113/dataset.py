@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader, Dataset
 
 _SLICE_NAME = re.compile(r"^(?P<sample>.+)_(?P<slice>\d+)$")
 _IMAGE_SUFFIXES = {".jpg", ".jpeg"}
+_FOREGROUND_THRESHOLD = 10 / 255
 
 
 @dataclass(frozen=True)
@@ -92,21 +93,98 @@ def _image_to_tensor(
     path: Path,
     image_size: tuple[int, int] | None,
 ) -> Tensor:
-    """Read an image as an RGB float tensor in ``[0, 1]``."""
+    """Read, foreground-centre and resize an image to an RGB tensor."""
 
     with Image.open(path) as image:
         image = image.convert("RGB")
         if image_size is not None:
-            # Public APIs conventionally specify (height, width), whereas PIL
-            # expects (width, height).
             height, width = image_size
-            image = image.resize((width, height), Image.Resampling.BILINEAR)
+            image = _foreground_centered_crop(image, (height, width))
+            if image.size != (width, height):
+                # Public APIs specify (height, width), whereas PIL expects
+                # (width, height).
+                image = image.resize((width, height), Image.Resampling.BILINEAR)
         width, height = image.size
         pixels = torch.frombuffer(
             bytearray(image.tobytes()), dtype=torch.uint8
         ).view(height, width, 3)
 
     return pixels.permute(2, 0, 1).contiguous().float().div_(255.0)
+
+
+def _foreground_centered_crop(
+    image: Image.Image,
+    crop_size: tuple[int, int],
+) -> Image.Image:
+    """Take a constant-size crop centred on non-black anatomy.
+
+    The crop size stays fixed rather than fitting each brain tightly, so
+    anatomical scale differences are preserved. JPEG compression can make the
+    nominally black background slightly non-zero, hence the small threshold.
+    """
+
+    target_height, target_width = crop_size
+    crop_width = min(target_width, image.width)
+    crop_height = min(target_height, image.height)
+
+    grayscale = image.convert("L")
+    threshold = round(_FOREGROUND_THRESHOLD * 255)
+    foreground = grayscale.point(lambda value: 255 if value > threshold else 0)
+    bounding_box = foreground.getbbox()
+
+    if bounding_box is None:
+        centre_x = image.width / 2
+        centre_y = image.height / 2
+    else:
+        left, top, right, bottom = bounding_box
+        centre_x = (left + right) / 2
+        centre_y = (top + bottom) / 2
+
+    crop_left = round(centre_x - crop_width / 2)
+    crop_top = round(centre_y - crop_height / 2)
+    crop_left = min(max(crop_left, 0), image.width - crop_width)
+    crop_top = min(max(crop_top, 0), image.height - crop_height)
+
+    return image.crop(
+        (
+            crop_left,
+            crop_top,
+            crop_left + crop_width,
+            crop_top + crop_height,
+        )
+    )
+
+
+def _calculate_foreground_statistics(
+    samples: Sequence[ADNISample],
+    subject_indices: Sequence[int],
+    image_size: tuple[int, int] | None,
+) -> tuple[float, float]:
+    """Calculate foreground mean/std using training subjects only."""
+
+    pixel_sum = 0.0
+    squared_pixel_sum = 0.0
+    pixel_count = 0
+
+    for subject_index in subject_indices:
+        for path in samples[subject_index].slice_paths:
+            # ADNI JPEGs are grayscale replicated across RGB, so one channel
+            # contains all unique intensity information.
+            pixels = _image_to_tensor(path, image_size)[0]
+            foreground = pixels[pixels > _FOREGROUND_THRESHOLD].double()
+            pixel_sum += foreground.sum().item()
+            squared_pixel_sum += foreground.square().sum().item()
+            pixel_count += foreground.numel()
+
+    if pixel_count == 0:
+        raise RuntimeError("Training images contain no foreground pixels")
+
+    mean = pixel_sum / pixel_count
+    variance = max(squared_pixel_sum / pixel_count - mean**2, 0.0)
+    standard_deviation = variance**0.5
+    if standard_deviation == 0.0:
+        raise RuntimeError("Training foreground has zero standard deviation")
+    return mean, standard_deviation
 
 
 class ADNISubjectIndex:
@@ -217,11 +295,23 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         subject_dataset: ADNISubjectIndex,
         subject_indices: Sequence[int] | None = None,
         *,
+        foreground_statistics: tuple[float, float] | None = None,
         transform: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
         self.class_to_idx = dict(subject_dataset.class_to_idx)
         self.image_size = subject_dataset.image_size
+        self.foreground_statistics = foreground_statistics
         self.transform = transform
+
+        if foreground_statistics is not None:
+            mean, standard_deviation = foreground_statistics
+            if standard_deviation <= 0:
+                raise ValueError("foreground standard deviation must be positive")
+            self.foreground_mean = float(mean)
+            self.foreground_standard_deviation = float(standard_deviation)
+        else:
+            self.foreground_mean = None
+            self.foreground_standard_deviation = None
 
         if subject_indices is None:
             selected_indices = tuple(range(len(subject_dataset)))
@@ -273,6 +363,14 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         image = _image_to_tensor(item.path, self.image_size)
         if self.transform is not None:
             image = self.transform(image)
+        if self.foreground_statistics is not None:
+            foreground = image.amax(dim=0, keepdim=True) > _FOREGROUND_THRESHOLD
+            image = torch.where(
+                foreground,
+                (image - self.foreground_mean)
+                / self.foreground_standard_deviation,
+                0.0,
+            )
 
         return {
             "image": image,
@@ -351,19 +449,27 @@ def create_adni_slice_dataloaders(
     ).tolist()
     training_indices = permutation[:training_count]
     validation_indices = permutation[training_count:]
+    foreground_statistics = _calculate_foreground_statistics(
+        training_subjects.samples,
+        training_indices,
+        image_size,
+    )
 
     training_slices = ADNISliceDataset(
         training_subjects,
         training_indices,
+        foreground_statistics=foreground_statistics,
         transform=train_transform,
     )
     validation_slices = ADNISliceDataset(
         training_subjects,
         validation_indices,
+        foreground_statistics=foreground_statistics,
         transform=evaluation_transform,
     )
     test_slices = ADNISliceDataset(
         test_subjects,
+        foreground_statistics=foreground_statistics,
         transform=evaluation_transform,
     )
 
