@@ -486,6 +486,11 @@ def main() -> None:
     print(f"Training slices: {len(training_dataset)}")
     print(f"Validation slices: {len(validation_loader.dataset)}")
     print(f"Test slices: {len(test_loader.dataset)}")
+    print(
+        f"Training foreground statistics: mean "
+        f"{training_dataset.foreground_mean:.4f}, standard deviation "
+        f"{training_dataset.foreground_standard_deviation:.4f}"
+    )
     print(f"Trainable parameters: {trainable_parameters:,}")
     print(
         f"Base learning rate: {args.learning_rate:g}; "
@@ -626,6 +631,10 @@ def main() -> None:
                     "epochs_requested": args.epochs,
                     "batch_size": args.batch_size,
                     "image_size": list(IMAGE_SIZE),
+                    "foreground_mean": training_dataset.foreground_mean,
+                    "foreground_standard_deviation": (
+                        training_dataset.foreground_standard_deviation
+                    ),
                     "learning_rate": args.learning_rate,
                     "weight_decay": args.weight_decay,
                     "stochastic_depth": args.stochastic_depth,

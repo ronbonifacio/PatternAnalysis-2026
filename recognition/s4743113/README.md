@@ -47,6 +47,14 @@ prematurely. Final test inference uses the best saved weights.
 - Increased early-stopping patience from 5 to 20 epochs.
 - Reduced the minimum validation-loss improvement from `0.001` to `0.0001`.
 
+## MRI preprocessing
+
+Each original 256×240 slice receives a constant 224×224 crop centred on its
+non-black foreground. The fixed crop size removes empty border without
+rescaling individual brains. Foreground mean and standard deviation are then
+calculated from training subjects only and reused to normalize training,
+validation and test slices, while black background pixels remain zero.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
