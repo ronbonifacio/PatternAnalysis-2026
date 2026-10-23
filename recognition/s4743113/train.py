@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("float16", "bfloat16", "float32"),
+        default="float16",
+        help="CUDA compute precision; float32 disables autocasting.",
+    )
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
     parser.add_argument(
         "--learning-rate-scheduler",
@@ -185,20 +191,22 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     gradient_clip: float | None = None,
+    autocast_dtype: torch.dtype | None = torch.float16,
 ) -> EpochMetrics:
     """Run one training or validation epoch and return slice-level metrics."""
 
     is_training = optimizer is not None
     model.train(is_training)
-    use_amp = device.type == "cuda"
+    is_cuda = device.type == "cuda"
+    use_amp = is_cuda and autocast_dtype is not None
 
     total_loss = 0.0
     total_correct = 0
     total_slices = 0
 
-    for batch in loader:
-        images = batch["image"].to(device, non_blocking=use_amp)
-        labels = batch["label"].to(device, non_blocking=use_amp)
+    for batch_index, batch in enumerate(loader, start=1):
+        images = batch["image"].to(device, non_blocking=is_cuda)
+        labels = batch["label"].to(device, non_blocking=is_cuda)
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -206,23 +214,38 @@ def run_epoch(
         with torch.set_grad_enabled(is_training):
             with torch.autocast(
                 device_type=device.type,
-                dtype=torch.float16,
+                dtype=autocast_dtype or torch.float16,
                 enabled=use_amp,
             ):
                 logits = model(images)
                 loss = criterion(logits, labels)
 
+            if not torch.isfinite(loss).item():
+                phase = "training" if is_training else "validation"
+                raise FloatingPointError(
+                    f"Non-finite {phase} loss at batch {batch_index}; "
+                    "stopping before model weights can be corrupted."
+                )
+
             if is_training:
                 if scaler is None:
                     loss.backward()
                     if gradient_clip is not None:
-                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                        nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            gradient_clip,
+                            error_if_nonfinite=True,
+                        )
                     optimizer.step()
                 else:
                     scaler.scale(loss).backward()
                     if gradient_clip is not None:
                         scaler.unscale_(optimizer)
-                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                        nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            gradient_clip,
+                            error_if_nonfinite=False,
+                        )
                     scaler.step(optimizer)
                     scaler.update()
 
@@ -300,27 +323,35 @@ def infer_test_set(
     criterion: nn.Module,
     device: torch.device,
     ad_index: int,
+    autocast_dtype: torch.dtype | None = torch.float16,
 ) -> tuple[float, list[TestResult]]:
     """Run slice-level test inference and retain per-slice results."""
 
     model.eval()
-    use_amp = device.type == "cuda"
+    is_cuda = device.type == "cuda"
+    use_amp = is_cuda and autocast_dtype is not None
     total_loss = 0.0
     total_slices = 0
     results: list[TestResult] = []
 
     with torch.inference_mode():
-        for batch in loader:
-            images = batch["image"].to(device, non_blocking=use_amp)
-            labels = batch["label"].to(device, non_blocking=use_amp)
+        for batch_index, batch in enumerate(loader, start=1):
+            images = batch["image"].to(device, non_blocking=is_cuda)
+            labels = batch["label"].to(device, non_blocking=is_cuda)
 
             with torch.autocast(
                 device_type=device.type,
-                dtype=torch.float16,
+                dtype=autocast_dtype or torch.float16,
                 enabled=use_amp,
             ):
                 logits = model(images)
                 loss = criterion(logits, labels)
+
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(
+                    f"Non-finite test loss at batch {batch_index}; "
+                    "the selected checkpoint is invalid."
+                )
 
             probabilities = logits.softmax(dim=1).float().cpu()
             predictions = probabilities.argmax(dim=1)
@@ -540,6 +571,18 @@ def main() -> None:
     )
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
+    if (
+        device.type == "cuda"
+        and args.amp_dtype == "bfloat16"
+        and not torch.cuda.is_bf16_supported()
+    ):
+        raise RuntimeError("bfloat16 was requested but this GPU does not support it")
+
+    autocast_dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": None,
+    }[args.amp_dtype]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     best_weights_path = args.output_dir / "best_model_weights.pt"
@@ -622,6 +665,7 @@ def main() -> None:
     )
     print(f"Trainable parameters: {trainable_parameters:,}")
     print(f"Split seed: {args.seed}; training seed: {training_seed}")
+    print(f"CUDA compute precision: {args.amp_dtype}")
     checkpoint_description = (
         "last"
         if args.test_checkpoint == "last"
@@ -643,6 +687,7 @@ def main() -> None:
             evaluation_criterion,
             device,
             ad_index,
+            autocast_dtype,
         )
         test_metrics = report_test_results(
             test_loss,
@@ -662,6 +707,7 @@ def main() -> None:
                     "input_mode": args.input_mode,
                     "label_smoothing": args.label_smoothing,
                     "test_checkpoint": args.test_checkpoint,
+                    "amp_dtype": args.amp_dtype,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -707,7 +753,9 @@ def main() -> None:
             warmup_epochs=args.warmup_epochs,
             minimum_learning_rate=COSINE_MIN_LR,
         )
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    scaler = None
+    if device.type == "cuda" and autocast_dtype == torch.float16:
+        scaler = torch.amp.GradScaler("cuda")
 
     print(
         f"Base learning rate: {args.learning_rate:g}; "
@@ -755,12 +803,14 @@ def main() -> None:
             optimizer=optimizer,
             scaler=scaler,
             gradient_clip=args.gradient_clip,
+            autocast_dtype=autocast_dtype,
         )
         validation_metrics = run_epoch(
             model,
             validation_loader,
             evaluation_criterion,
             device,
+            autocast_dtype=autocast_dtype,
         )
 
         history.append(
@@ -875,6 +925,7 @@ def main() -> None:
         evaluation_criterion,
         device,
         ad_index,
+        autocast_dtype,
     )
     test_metrics = report_test_results(
         test_loss,
@@ -903,6 +954,7 @@ def main() -> None:
                     "stochastic_depth": args.stochastic_depth,
                     "label_smoothing": args.label_smoothing,
                     "test_checkpoint": args.test_checkpoint,
+                    "amp_dtype": args.amp_dtype,
                     "warmup_epochs": args.warmup_epochs,
                     "plateau_patience": PLATEAU_PATIENCE,
                     "plateau_factor": PLATEAU_FACTOR,

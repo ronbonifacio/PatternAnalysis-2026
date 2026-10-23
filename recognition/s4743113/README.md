@@ -105,6 +105,13 @@ weight decay to `0.05`, and adds label smoothing `0.1`. It saves the best
 validation-accuracy checkpoint for final testing. Run it with
 `sbatch train_convnext_regularized.sh`.
 
+## 96×96 experiment
+
+`train_regularized_96.py` keeps batch size 8 and the same regularisation while
+increasing the resized input to 96×96. It uses `bfloat16` on the A100 and stops
+immediately if a loss or gradient becomes non-finite. Run it with
+`sbatch train_convnext_regularized_96.sh`.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
