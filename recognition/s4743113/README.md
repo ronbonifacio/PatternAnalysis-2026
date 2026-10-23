@@ -89,6 +89,14 @@ slices to 3,444 and stores results separately under
 It otherwise uses the same 100-epoch cosine setup and can be submitted with
 `sbatch train_convnext_subsampled.sh`.
 
+## Small-input pilot
+
+`train_small_input.py` trains on all 17,220 slices with batch size 8. A check
+on eight images found that both a central 64×64 crop and the complete brain
+resized to 64×64 reached 100% training accuracy; the resized version learned
+faster, so the pilot uses it. Full validation loss and accuracy are reported
+after every epoch. Run it with `sbatch train_convnext_small_input.sh`.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)

@@ -13,11 +13,13 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from dataset import ADNISliceDataset, create_adni_slice_dataloaders, set_seed
@@ -28,7 +30,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = SCRIPT_DIR / "ADNI" / "AD_NC"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_slice_level"
 
-IMAGE_SIZE = (224, 224)
+DEFAULT_IMAGE_SIZE = 224
+FULL_FOREGROUND_CROP_SIZE = (224, 224)
 EARLY_STOPPING_PATIENCE = 20
 EARLY_STOPPING_MIN_DELTA = 0.0001
 DEFAULT_EARLY_STOPPING_START_EPOCH = 10
@@ -63,6 +66,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument(
+        "--input-mode",
+        choices=("crop", "resize"),
+        default="crop",
+        help=(
+            "Either take a foreground-centred crop at --image-size, or take "
+            "the complete 224-pixel foreground crop and resize it."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
@@ -115,6 +128,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.image_size < 32:
+        parser.error("--image-size must be at least 32 for ConvNeXt")
     if args.learning_rate <= 0:
         parser.error("--learning-rate must be positive")
     if args.weight_decay < 0:
@@ -136,6 +151,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slices-per-scan-per-epoch must be positive")
 
     return args
+
+
+def resize_tensor_image(image: torch.Tensor, *, size: int) -> torch.Tensor:
+    """Resize a CHW tensor to a square without taking another crop."""
+
+    if image.shape[-2:] == (size, size):
+        return image
+    return F.interpolate(
+        image.unsqueeze(0),
+        size=(size, size),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    ).squeeze(0)
 
 
 def run_epoch(
@@ -490,6 +519,12 @@ def main() -> None:
     args = parse_args()
     training_seed = args.seed if args.training_seed is None else args.training_seed
     set_seed(training_seed)
+    image_size = (args.image_size, args.image_size)
+    loader_image_size = image_size
+    input_transform = None
+    if args.input_mode == "resize":
+        loader_image_size = FULL_FOREGROUND_CROP_SIZE
+        input_transform = partial(resize_tensor_image, size=args.image_size)
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -514,7 +549,9 @@ def main() -> None:
         seed=args.seed,
         training_seed=training_seed,
         training_slices_per_scan=args.slices_per_scan_per_epoch,
-        image_size=IMAGE_SIZE,
+        image_size=loader_image_size,
+        train_transform=input_transform,
+        evaluation_transform=input_transform,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -552,6 +589,11 @@ def main() -> None:
     print(f"Training slices selected per epoch: {len(train_loader.sampler)}")
     print(f"Validation slices: {len(validation_loader.dataset)}")
     print(f"Test slices: {len(test_loader.dataset)}")
+    print(f"Model input size: {args.image_size}x{args.image_size}")
+    if args.input_mode == "resize":
+        print("Input preprocessing: resize complete 224x224 foreground crop")
+    else:
+        print(f"Input preprocessing: fixed {args.image_size}x{args.image_size} crop")
     print(
         f"Training foreground statistics: mean "
         f"{training_dataset.foreground_mean:.4f}, standard deviation "
@@ -586,7 +628,8 @@ def main() -> None:
                 {
                     "weights": str(best_weights_path),
                     "batch_size": args.batch_size,
-                    "image_size": list(IMAGE_SIZE),
+                    "image_size": list(image_size),
+                    "input_mode": args.input_mode,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -798,7 +841,8 @@ def main() -> None:
                 "configuration": {
                     "epochs_requested": args.epochs,
                     "batch_size": args.batch_size,
-                    "image_size": list(IMAGE_SIZE),
+                    "image_size": list(image_size),
+                    "input_mode": args.input_mode,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
