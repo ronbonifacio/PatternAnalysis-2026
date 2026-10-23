@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         choices=("plateau", "cosine"),
         default="plateau",
     )
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Evaluate the saved best weights without training again.",
+    )
     parser.add_argument("--disable-early-stopping", action="store_true")
     parser.add_argument(
         "--gradient-clip",
@@ -86,6 +91,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--training-seed",
+        type=int,
+        default=None,
+        help="Seed for model initialization, batch order and slice sampling.",
+    )
+    parser.add_argument(
+        "--slices-per-scan-per-epoch",
+        type=int,
+        default=None,
+        help="Randomly select this many training slices from each scan per epoch.",
+    )
     parser.add_argument(
         "--device",
         choices=("cpu", "cuda"),
@@ -112,6 +129,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-start-epoch cannot be negative")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
+    if (
+        args.slices_per_scan_per_epoch is not None
+        and args.slices_per_scan_per_epoch <= 0
+    ):
+        parser.error("--slices-per-scan-per-epoch must be positive")
 
     return args
 
@@ -324,17 +346,7 @@ def report_test_results(
     idx_to_class: dict[int, str],
     output_dir: Path,
 ) -> dict[str, Any]:
-    """Print slice-level test metrics and save a confusion-matrix figure."""
-
-    # Use a non-interactive backend and keep Matplotlib's generated cache with
-    # the other ignored training outputs rather than in the user's home folder.
-    matplotlib_config_dir = output_dir / ".matplotlib"
-    matplotlib_config_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config_dir))
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    """Print test metrics and optionally save a confusion-matrix figure."""
 
     true_positives = sum(
         result.prediction == ad_index and result.target == ad_index
@@ -370,6 +382,18 @@ def report_test_results(
     recall = safe_divide(true_positives, true_positives + false_negatives)
     f1 = safe_divide(2 * precision * recall, precision + recall)
 
+    metrics = {
+        "loss": test_loss,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_negatives": true_negatives,
+        "false_positives": false_positives,
+        "false_negatives": false_negatives,
+        "true_positives": true_positives,
+    }
+
     print("\nSlice-level test results (AD is the positive class)")
     print(f"Loss:      {test_loss:.4f}")
     print(f"Accuracy:  {accuracy:.2%} ({len(correct)}/{len(results)})")
@@ -398,6 +422,23 @@ def report_test_results(
         [true_negatives, false_positives],
         [false_negatives, true_positives],
     ]
+
+    # Plotting is optional: test inference, terminal metrics, and metrics.json
+    # must still complete on the HPC environment, which has no Matplotlib.
+    matplotlib_config_dir = output_dir / ".matplotlib"
+    matplotlib_config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config_dir))
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as error:
+        if error.name is None or not error.name.startswith("matplotlib"):
+            raise
+        print("Matplotlib is unavailable; skipped the confusion-matrix image.")
+        return metrics
+
     cell_labels = [
         [f"TN\n{true_negatives}", f"FP\n{false_positives}"],
         [f"FN\n{false_negatives}", f"TP\n{true_positives}"],
@@ -442,22 +483,13 @@ def report_test_results(
     plt.close(figure)
     print(f"Confusion matrix saved to: {confusion_matrix_path}")
 
-    return {
-        "loss": test_loss,
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "true_negatives": true_negatives,
-        "false_positives": false_positives,
-        "false_negatives": false_negatives,
-        "true_positives": true_positives,
-    }
+    return metrics
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    training_seed = args.seed if args.training_seed is None else args.training_seed
+    set_seed(training_seed)
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -469,12 +501,19 @@ def main() -> None:
     best_weights_path = args.output_dir / "best_model_weights.pt"
     last_weights_path = args.output_dir / "last_model_weights.pt"
     metrics_path = args.output_dir / "metrics.json"
+    if args.evaluate_only and not best_weights_path.is_file():
+        raise FileNotFoundError(
+            f"Cannot evaluate because the best weights do not exist: "
+            f"{best_weights_path}"
+        )
 
     train_loader, validation_loader, test_loader = create_adni_slice_dataloaders(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         validation_fraction=args.validation_fraction,
         seed=args.seed,
+        training_seed=training_seed,
+        training_slices_per_scan=args.slices_per_scan_per_epoch,
         image_size=IMAGE_SIZE,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
@@ -490,11 +529,79 @@ def main() -> None:
     ad_index = class_to_idx["AD"]
     nc_index = class_to_idx["NC"]
 
+    # Dataset construction uses the split seed. Restore the independent
+    # training seed before model-weight initialization.
+    set_seed(training_seed)
     model = convnext_tiny(
         num_classes=len(class_to_idx),
         stochastic_depth_probability=args.stochastic_depth,
     ).to(device)
     criterion = nn.CrossEntropyLoss()
+
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    print(f"Device: {device}")
+    print(f"Classes: {class_to_idx}")
+    print(f"Training scans: {training_dataset.subject_count}")
+    print(f"Validation scans: {validation_loader.dataset.subject_count}")
+    print(f"Test scans: {test_loader.dataset.subject_count}")
+    print(f"Training slices available: {len(training_dataset)}")
+    print(f"Training slices selected per epoch: {len(train_loader.sampler)}")
+    print(f"Validation slices: {len(validation_loader.dataset)}")
+    print(f"Test slices: {len(test_loader.dataset)}")
+    print(
+        f"Training foreground statistics: mean "
+        f"{training_dataset.foreground_mean:.4f}, standard deviation "
+        f"{training_dataset.foreground_standard_deviation:.4f}"
+    )
+    print(f"Trainable parameters: {trainable_parameters:,}")
+    print(f"Split seed: {args.seed}; training seed: {training_seed}")
+
+    if args.evaluate_only:
+        print(f"Evaluation only; loading weights from: {best_weights_path}")
+        model.load_state_dict(
+            torch.load(best_weights_path, map_location=device, weights_only=True)
+        )
+        test_loss, test_results = infer_test_set(
+            model,
+            test_loader,
+            criterion,
+            device,
+            ad_index,
+        )
+        test_metrics = report_test_results(
+            test_loss,
+            test_results,
+            ad_index=ad_index,
+            nc_index=nc_index,
+            idx_to_class=idx_to_class,
+            output_dir=args.output_dir,
+        )
+        test_metrics_path = args.output_dir / "test_metrics.json"
+        with test_metrics_path.open("w", encoding="utf-8") as metrics_file:
+            json.dump(
+                {
+                    "weights": str(best_weights_path),
+                    "batch_size": args.batch_size,
+                    "image_size": list(IMAGE_SIZE),
+                    "foreground_mean": training_dataset.foreground_mean,
+                    "foreground_standard_deviation": (
+                        training_dataset.foreground_standard_deviation
+                    ),
+                    "seed": args.seed,
+                    "training_seed": training_seed,
+                    "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
+                    "test": test_metrics,
+                },
+                metrics_file,
+                indent=2,
+            )
+        print(f"Test metrics saved to: {test_metrics_path}")
+        return
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -527,23 +634,6 @@ def main() -> None:
         )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    trainable_parameters = sum(
-        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
-    )
-    print(f"Device: {device}")
-    print(f"Classes: {class_to_idx}")
-    print(f"Training subjects: {training_dataset.subject_count}")
-    print(f"Validation subjects: {validation_loader.dataset.subject_count}")
-    print(f"Test subjects: {test_loader.dataset.subject_count}")
-    print(f"Training slices: {len(training_dataset)}")
-    print(f"Validation slices: {len(validation_loader.dataset)}")
-    print(f"Test slices: {len(test_loader.dataset)}")
-    print(
-        f"Training foreground statistics: mean "
-        f"{training_dataset.foreground_mean:.4f}, standard deviation "
-        f"{training_dataset.foreground_standard_deviation:.4f}"
-    )
-    print(f"Trainable parameters: {trainable_parameters:,}")
     print(
         f"Base learning rate: {args.learning_rate:g}; "
         f"warm-up epochs: {args.warmup_epochs}; "
@@ -732,6 +822,8 @@ def main() -> None:
                     "early_stopping_patience": EARLY_STOPPING_PATIENCE,
                     "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
                     "seed": args.seed,
+                    "training_seed": training_seed,
+                    "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
                 },
                 "best_epoch": best_epoch,
                 "history": history,

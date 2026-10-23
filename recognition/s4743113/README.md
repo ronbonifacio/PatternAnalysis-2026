@@ -12,11 +12,11 @@ subject. It stopped at epoch 24 with a best validation accuracy of 59.07%, well
 below the 80% target, so this design was superseded. Its dataset, model and
 training code remain in the three `*_subject_level_superseded.py` files.
 
-## Subject-safe slice classification
+## Scan-safe slice classification
 
-The active data loader groups filenames by subject before making the 80/20
+The active data loader groups filenames by MRI scan before making the 80/20
 training and validation split. It then flattens each subset into individual
-slices, ensuring similar slices from one subject cannot cross the split.
+slices, ensuring neighbouring slices from one scan cannot cross the split.
 ConvNeXt receives one 224×224 slice and returns one AD/NC prediction, with no
 cross-slice averaging. Test accuracy and the confusion matrix are calculated
 over the 9,000 test slices.
@@ -52,7 +52,7 @@ prematurely. Final test inference uses the best saved weights.
 Each original 256×240 slice receives a constant 224×224 crop centred on its
 non-black foreground. The fixed crop size removes empty border without
 rescaling individual brains. Foreground mean and standard deviation are then
-calculated from training subjects only and reused to normalize training,
+calculated from training scans only and reused to normalize training,
 validation and test slices, while black background pixels remain zero.
 
 ## Cosine scheduler experiment
@@ -61,6 +61,33 @@ validation and test slices, while black background pixels remain zero.
 preprocessing. It warms up to `0.0001`, follows cosine annealing down to
 `0.000001`, and completes all 100 epochs without early stopping. Its weights
 and metrics use a separate `output/convnext_tiny_slice_level_cosine` folder.
+
+Test metrics and the confusion matrix are printed and saved as JSON even when
+Matplotlib is unavailable; only the optional PNG is skipped. A completed
+cosine checkpoint can be tested without retraining with
+`sbatch train_convnext_cosine.sh --evaluate-only`.
+
+## Training diagnosis
+
+The cosine run plateaued at 66.14% training accuracy and approximately 61%
+validation accuracy. A separate memorization check reached 100% accuracy on
+eight real slices within a few updates at both `0.0001` and `0.001`, confirming
+that the model, gradients and optimizer work correctly. The full-data plateau
+is therefore more likely caused by weak slice-level supervision: all slices
+inherit the scan diagnosis even though an individual slice may contain limited
+diagnostic information, and the 21,520 correlated slices represent only 1,076
+scans. Further fixed-epoch cosine training is unlikely to resolve this plateau.
+
+## Slice-subsampling pilot
+
+`train_subsampled.py` keeps the original scan split (`seed=42`) but uses
+training seed `123`. Each epoch randomly selects four distinct slices from
+every training scan and reshuffles them, while validation and test inference
+still use every slice. This reduces each training epoch from 17,220 correlated
+slices to 3,444 and stores results separately under
+`output/convnext_tiny_slice_subsampling`.
+It otherwise uses the same 100-epoch cosine setup and can be submitted with
+`sbatch train_convnext_subsampled.sh`.
 
 ## References
 

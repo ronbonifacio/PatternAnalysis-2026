@@ -21,6 +21,7 @@ from __future__ import annotations
 import random
 import re
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -28,7 +29,7 @@ from typing import Callable, Mapping, Sequence
 import torch
 from PIL import Image
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
 _SLICE_NAME = re.compile(r"^(?P<sample>.+)_(?P<slice>\d+)$")
@@ -38,7 +39,7 @@ _FOREGROUND_THRESHOLD = 10 / 255
 
 @dataclass(frozen=True)
 class ADNISample:
-    """The files and label belonging to one ADNI sample."""
+    """The files and label belonging to one ADNI MRI scan."""
 
     sample_id: str
     label: int
@@ -188,7 +189,7 @@ def _calculate_foreground_statistics(
 
 
 class ADNISubjectIndex:
-    """Index slice paths by subject before creating slice datasets."""
+    """Index slice paths by scan before creating slice datasets."""
 
     def __init__(
         self,
@@ -285,9 +286,9 @@ class ADNISubjectIndex:
 class ADNISliceDataset(Dataset[dict[str, object]]):
     """Expose slices from selected subjects as independent examples.
 
-    Subject indices are chosen before this dataset is created. Therefore,
-    flattening the selected subjects into slices cannot place neighbouring
-    slices from one subject in both the training and validation subsets.
+    Scan indices are chosen before this dataset is created. Therefore,
+    flattening the selected scans into slices cannot place neighbouring slices
+    from one scan in both the training and validation subsets.
     """
 
     def __init__(
@@ -380,22 +381,77 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         }
 
 
+class RandomSlicesPerScanSampler(Sampler[int]):
+    """Select a new random subset of each scan's slices every epoch."""
+
+    def __init__(
+        self,
+        dataset: ADNISliceDataset,
+        slices_per_scan: int,
+        *,
+        seed: int,
+    ) -> None:
+        if slices_per_scan <= 0:
+            raise ValueError("slices_per_scan must be positive")
+
+        grouped_indices: dict[tuple[int, str], list[int]] = defaultdict(list)
+        for index, item in enumerate(dataset.slices):
+            grouped_indices[(item.label, item.sample_id)].append(index)
+
+        if not grouped_indices:
+            raise ValueError("Cannot sample slices from an empty dataset")
+
+        self.scan_indices = tuple(
+            tuple(indices) for indices in grouped_indices.values()
+        )
+        self.slices_per_scan = slices_per_scan
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[int]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+
+        selected_indices: list[int] = []
+        for scan_indices in self.scan_indices:
+            count = min(self.slices_per_scan, len(scan_indices))
+            selection = torch.randperm(
+                len(scan_indices),
+                generator=generator,
+            )[:count]
+            selected_indices.extend(scan_indices[index] for index in selection)
+
+        order = torch.randperm(
+            len(selected_indices),
+            generator=generator,
+        ).tolist()
+        return iter(selected_indices[index] for index in order)
+
+    def __len__(self) -> int:
+        return sum(
+            min(self.slices_per_scan, len(scan_indices))
+            for scan_indices in self.scan_indices
+        )
+
+
 def create_adni_slice_dataloaders(
     data_dir: str | Path | None = None,
     *,
     batch_size: int = 48,
     validation_fraction: float = 0.2,
     seed: int = 42,
+    training_seed: int | None = None,
+    training_slices_per_scan: int | None = None,
     image_size: tuple[int, int] | None = (224, 224),
     train_transform: Callable[[Tensor], Tensor] | None = None,
     evaluation_transform: Callable[[Tensor], Tensor] | None = None,
     num_workers: int = 0,
     pin_memory: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Create slice loaders after a deterministic subject-level split.
+    """Create slice loaders after a deterministic scan-level split.
 
-    Training subjects are split 80/20 before their records are flattened into
-    individual slices. All slices from a subject therefore stay entirely in
+    Training scans are split 80/20 before their records are flattened into
+    individual slices. All slices from a scan therefore stay entirely in
     either training or validation, while ConvNeXt still receives one 2D slice
     and one label for each dataset item. The provided test split is flattened
     in the same way and remains separate from both subsets.
@@ -407,6 +463,11 @@ def create_adni_slice_dataloaders(
         raise ValueError("validation_fraction must be between 0 and 1")
     if num_workers < 0:
         raise ValueError("num_workers cannot be negative")
+    if training_slices_per_scan is not None and training_slices_per_scan <= 0:
+        raise ValueError("training_slices_per_scan must be positive")
+
+    if training_seed is None:
+        training_seed = seed
 
     set_seed(seed)
     data_path = (
@@ -433,11 +494,13 @@ def create_adni_slice_dataloaders(
         (sample.label, sample.sample_id) for sample in test_subjects.samples
     }
     if training_identities & test_identities:
-        raise RuntimeError("A subject appears in both the provided train and test splits")
+        raise RuntimeError(
+            "A scan appears in both the provided train and test splits"
+        )
 
     subject_count = len(training_subjects)
     if subject_count < 2:
-        raise ValueError("At least two grouped training subjects are required")
+        raise ValueError("At least two grouped training scans are required")
     validation_count = max(1, round(subject_count * validation_fraction))
     training_count = subject_count - validation_count
     if training_count == 0:
@@ -474,7 +537,7 @@ def create_adni_slice_dataloaders(
     )
 
     if set(training_slices.subject_ids) & set(validation_slices.subject_ids):
-        raise RuntimeError("A subject appears in both training and validation")
+        raise RuntimeError("A scan appears in both training and validation")
 
     common_loader_options = {
         "batch_size": batch_size,
@@ -483,10 +546,19 @@ def create_adni_slice_dataloaders(
         "persistent_workers": num_workers > 0,
         "worker_init_fn": _seed_worker,
     }
+    training_sampler = None
+    if training_slices_per_scan is not None:
+        training_sampler = RandomSlicesPerScanSampler(
+            training_slices,
+            training_slices_per_scan,
+            seed=training_seed,
+        )
+
     train_loader = DataLoader(
         training_slices,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(seed + 1),
+        shuffle=training_sampler is None,
+        sampler=training_sampler,
+        generator=torch.Generator().manual_seed(training_seed + 1),
         **common_loader_options,
     )
     validation_loader = DataLoader(
