@@ -97,6 +97,14 @@ resized to 64×64 reached 100% training accuracy; the resized version learned
 faster, so the pilot uses it. Full validation loss and accuracy are reported
 after every epoch. Run it with `sbatch train_convnext_small_input.sh`.
 
+## Regularised small-input experiment
+
+The 64×64 run reached 100% training and 80.53% validation accuracy but
+overfit. `train_regularized.py` adds stochastic depth `0.1` back, increases
+weight decay to `0.05`, and adds label smoothing `0.1`. It saves the best
+validation-accuracy checkpoint for final testing. Run it with
+`sbatch train_convnext_regularized.sh`.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
