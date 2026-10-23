@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
     parser.add_argument(
         "--learning-rate-scheduler",
@@ -89,6 +90,12 @@ def parse_args() -> argparse.Namespace:
         "--evaluate-only",
         action="store_true",
         help="Evaluate the saved best weights without training again.",
+    )
+    parser.add_argument(
+        "--test-checkpoint",
+        choices=("loss", "accuracy", "last"),
+        default="loss",
+        help="Checkpoint to use for final test inference.",
     )
     parser.add_argument("--disable-early-stopping", action="store_true")
     parser.add_argument(
@@ -136,6 +143,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--weight-decay cannot be negative")
     if not 0.0 <= args.stochastic_depth < 1.0:
         parser.error("--stochastic-depth must be in [0, 1)")
+    if not 0.0 <= args.label_smoothing < 1.0:
+        parser.error("--label-smoothing must be in [0, 1)")
     if args.warmup_epochs < 0:
         parser.error("--warmup-epochs cannot be negative")
     if args.gradient_clip <= 0:
@@ -534,12 +543,21 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     best_weights_path = args.output_dir / "best_model_weights.pt"
+    best_accuracy_weights_path = (
+        args.output_dir / "best_accuracy_model_weights.pt"
+    )
     last_weights_path = args.output_dir / "last_model_weights.pt"
     metrics_path = args.output_dir / "metrics.json"
-    if args.evaluate_only and not best_weights_path.is_file():
+    checkpoint_paths = {
+        "loss": best_weights_path,
+        "accuracy": best_accuracy_weights_path,
+        "last": last_weights_path,
+    }
+    test_weights_path = checkpoint_paths[args.test_checkpoint]
+    if args.evaluate_only and not test_weights_path.is_file():
         raise FileNotFoundError(
-            f"Cannot evaluate because the best weights do not exist: "
-            f"{best_weights_path}"
+            f"Cannot evaluate because the requested weights do not exist: "
+            f"{test_weights_path}"
         )
 
     train_loader, validation_loader, test_loader = create_adni_slice_dataloaders(
@@ -573,7 +591,10 @@ def main() -> None:
         num_classes=len(class_to_idx),
         stochastic_depth_probability=args.stochastic_depth,
     ).to(device)
-    criterion = nn.CrossEntropyLoss()
+    training_criterion = nn.CrossEntropyLoss(
+        label_smoothing=args.label_smoothing
+    )
+    evaluation_criterion = nn.CrossEntropyLoss()
 
     trainable_parameters = sum(
         parameter.numel()
@@ -601,16 +622,25 @@ def main() -> None:
     )
     print(f"Trainable parameters: {trainable_parameters:,}")
     print(f"Split seed: {args.seed}; training seed: {training_seed}")
+    checkpoint_description = (
+        "last"
+        if args.test_checkpoint == "last"
+        else f"best validation {args.test_checkpoint}"
+    )
+    print(
+        f"Label smoothing: {args.label_smoothing:g}; "
+        f"final test checkpoint: {checkpoint_description}"
+    )
 
     if args.evaluate_only:
-        print(f"Evaluation only; loading weights from: {best_weights_path}")
+        print(f"Evaluation only; loading weights from: {test_weights_path}")
         model.load_state_dict(
-            torch.load(best_weights_path, map_location=device, weights_only=True)
+            torch.load(test_weights_path, map_location=device, weights_only=True)
         )
         test_loss, test_results = infer_test_set(
             model,
             test_loader,
-            criterion,
+            evaluation_criterion,
             device,
             ad_index,
         )
@@ -626,10 +656,12 @@ def main() -> None:
         with test_metrics_path.open("w", encoding="utf-8") as metrics_file:
             json.dump(
                 {
-                    "weights": str(best_weights_path),
+                    "weights": str(test_weights_path),
                     "batch_size": args.batch_size,
                     "image_size": list(image_size),
                     "input_mode": args.input_mode,
+                    "label_smoothing": args.label_smoothing,
+                    "test_checkpoint": args.test_checkpoint,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -708,6 +740,8 @@ def main() -> None:
 
     best_validation_loss = float("inf")
     best_epoch = 0
+    best_validation_accuracy = -1.0
+    best_accuracy_epoch = 0
     epochs_without_improvement = 0
     history: list[dict[str, Any]] = []
 
@@ -716,7 +750,7 @@ def main() -> None:
         train_metrics = run_epoch(
             model,
             train_loader,
-            criterion,
+            training_criterion,
             device,
             optimizer=optimizer,
             scaler=scaler,
@@ -725,7 +759,7 @@ def main() -> None:
         validation_metrics = run_epoch(
             model,
             validation_loader,
-            criterion,
+            evaluation_criterion,
             device,
         )
 
@@ -779,6 +813,15 @@ def main() -> None:
                     f"({epochs_without_improvement}/{EARLY_STOPPING_PATIENCE})"
                 )
 
+        if validation_metrics.accuracy > best_validation_accuracy:
+            best_validation_accuracy = validation_metrics.accuracy
+            best_accuracy_epoch = epoch
+            torch.save(model.state_dict(), best_accuracy_weights_path)
+            print(
+                f"  Validation accuracy improved; saved weights to "
+                f"{best_accuracy_weights_path}"
+            )
+
         learning_rate_before_step = optimizer.param_groups[0]["lr"]
         if args.learning_rate_scheduler == "cosine":
             if cosine_scheduler is None:
@@ -814,15 +857,22 @@ def main() -> None:
     torch.save(model.state_dict(), last_weights_path)
     print(f"Best epoch: {best_epoch} (validation loss {best_validation_loss:.4f})")
     print(f"Best weights saved to: {best_weights_path}")
+    print(
+        f"Best validation accuracy: {best_validation_accuracy:.2%} at epoch "
+        f"{best_accuracy_epoch}"
+    )
+    print(f"Best-accuracy weights saved to: {best_accuracy_weights_path}")
     print(f"Final weights saved to: {last_weights_path}")
 
+    test_weights_path = checkpoint_paths[args.test_checkpoint]
+    print(f"Testing weights selected by {args.test_checkpoint}: {test_weights_path}")
     model.load_state_dict(
-        torch.load(best_weights_path, map_location=device, weights_only=True)
+        torch.load(test_weights_path, map_location=device, weights_only=True)
     )
     test_loss, test_results = infer_test_set(
         model,
         test_loader,
-        criterion,
+        evaluation_criterion,
         device,
         ad_index,
     )
@@ -851,6 +901,8 @@ def main() -> None:
                     "learning_rate_scheduler": args.learning_rate_scheduler,
                     "weight_decay": args.weight_decay,
                     "stochastic_depth": args.stochastic_depth,
+                    "label_smoothing": args.label_smoothing,
+                    "test_checkpoint": args.test_checkpoint,
                     "warmup_epochs": args.warmup_epochs,
                     "plateau_patience": PLATEAU_PATIENCE,
                     "plateau_factor": PLATEAU_FACTOR,
@@ -870,6 +922,9 @@ def main() -> None:
                     "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
                 },
                 "best_epoch": best_epoch,
+                "best_accuracy_epoch": best_accuracy_epoch,
+                "best_validation_accuracy": best_validation_accuracy,
+                "test_weights": str(test_weights_path),
                 "history": history,
                 "test": test_metrics,
             },
