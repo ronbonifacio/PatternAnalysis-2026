@@ -12,7 +12,7 @@ import argparse
 import json
 import math
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-jitter", type=float, default=0.05)
     parser.add_argument("--intensity-jitter", type=float, default=0.10)
     parser.add_argument("--noise-standard-deviation", type=float, default=0.01)
+    parser.add_argument("--horizontal-flip-probability", type=float, default=0.0)
+    parser.add_argument("--gamma-jitter", type=float, default=0.0)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
     parser.add_argument(
         "--learning-rate-scheduler",
@@ -122,6 +124,19 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_EARLY_STOPPING_START_EPOCH,
     )
     parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--split-level",
+        choices=("scan", "patient"),
+        default="scan",
+    )
+    parser.add_argument("--metadata-path", type=Path, default=None)
+    parser.add_argument(
+        "--normalization",
+        choices=("training", "per-slice"),
+        default="training",
+    )
+    parser.add_argument("--balance-patients", action="store_true")
+    parser.add_argument("--calibrate-threshold", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -168,6 +183,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--intensity-jitter must be in [0, 1)")
     if args.noise_standard_deviation < 0:
         parser.error("--noise-standard-deviation cannot be negative")
+    if not 0.0 <= args.horizontal_flip_probability <= 1.0:
+        parser.error("--horizontal-flip-probability must be in [0, 1]")
+    if not 0.0 <= args.gamma_jitter < 1.0:
+        parser.error("--gamma-jitter must be in [0, 1)")
     if args.warmup_epochs < 0:
         parser.error("--warmup-epochs cannot be negative")
     if args.gradient_clip <= 0:
@@ -211,6 +230,8 @@ class MRITrainAugmentation:
         scale_jitter: float,
         intensity_jitter: float,
         noise_standard_deviation: float,
+        horizontal_flip_probability: float = 0.0,
+        gamma_jitter: float = 0.0,
     ) -> None:
         self.size = size
         self.rotation_degrees = rotation_degrees
@@ -218,6 +239,8 @@ class MRITrainAugmentation:
         self.scale_jitter = scale_jitter
         self.intensity_jitter = intensity_jitter
         self.noise_standard_deviation = noise_standard_deviation
+        self.horizontal_flip_probability = horizontal_flip_probability
+        self.gamma_jitter = gamma_jitter
 
     @staticmethod
     def _uniform(low: float, high: float) -> float:
@@ -225,6 +248,8 @@ class MRITrainAugmentation:
 
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
         image = resize_tensor_image(image, size=self.size)
+        if torch.rand(()).item() < self.horizontal_flip_probability:
+            image = image.flip(-1)
 
         angle = math.radians(
             self._uniform(-self.rotation_degrees, self.rotation_degrees)
@@ -265,6 +290,15 @@ class MRITrainAugmentation:
         foreground = image.amax(dim=0, keepdim=True) > FOREGROUND_THRESHOLD
         foreground_values = image.masked_select(foreground.expand_as(image))
         if foreground_values.numel():
+            if self.gamma_jitter:
+                gamma = self._uniform(
+                    1.0 - self.gamma_jitter,
+                    1.0 + self.gamma_jitter,
+                )
+                image = image.clamp_min(0.0).pow(gamma)
+                foreground_values = image.masked_select(
+                    foreground.expand_as(image)
+                )
             foreground_mean = foreground_values.mean()
             contrast = self._uniform(
                 1.0 - self.intensity_jitter,
@@ -492,6 +526,185 @@ def safe_divide(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def apply_decision_threshold(
+    results: list[TestResult],
+    *,
+    threshold: float,
+    ad_index: int,
+    nc_index: int,
+) -> list[TestResult]:
+    """Convert AD probabilities into predictions at a fixed threshold."""
+
+    return [
+        replace(
+            result,
+            prediction=(
+                ad_index if result.ad_probability >= threshold else nc_index
+            ),
+        )
+        for result in results
+    ]
+
+
+def calculate_roc_auc(results: list[TestResult], *, ad_index: int) -> float:
+    """Calculate binary ROC-AUC with average ranks for tied probabilities."""
+
+    ordered = sorted(results, key=lambda result: result.ad_probability)
+    positive_count = sum(result.target == ad_index for result in ordered)
+    negative_count = len(ordered) - positive_count
+    if not positive_count or not negative_count:
+        return 0.0
+
+    positive_rank_sum = 0.0
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        probability = ordered[start].ad_probability
+        while (
+            end < len(ordered)
+            and ordered[end].ad_probability == probability
+        ):
+            end += 1
+        average_rank = ((start + 1) + end) / 2
+        positive_rank_sum += average_rank * sum(
+            result.target == ad_index for result in ordered[start:end]
+        )
+        start = end
+
+    return (
+        positive_rank_sum - positive_count * (positive_count + 1) / 2
+    ) / (positive_count * negative_count)
+
+
+def calculate_classification_metrics(
+    loss: float,
+    results: list[TestResult],
+    *,
+    ad_index: int,
+    nc_index: int,
+    decision_threshold: float,
+) -> dict[str, Any]:
+    true_positives = sum(
+        result.prediction == ad_index and result.target == ad_index
+        for result in results
+    )
+    false_positives = sum(
+        result.prediction == ad_index and result.target == nc_index
+        for result in results
+    )
+    false_negatives = sum(
+        result.prediction == nc_index and result.target == ad_index
+        for result in results
+    )
+    true_negatives = sum(
+        result.prediction == nc_index and result.target == nc_index
+        for result in results
+    )
+    accuracy = safe_divide(true_positives + true_negatives, len(results))
+    precision = safe_divide(true_positives, true_positives + false_positives)
+    recall = safe_divide(true_positives, true_positives + false_negatives)
+    specificity = safe_divide(true_negatives, true_negatives + false_positives)
+    f1 = safe_divide(2 * precision * recall, precision + recall)
+    return {
+        "loss": loss,
+        "accuracy": accuracy,
+        "balanced_accuracy": (recall + specificity) / 2,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "roc_auc": calculate_roc_auc(results, ad_index=ad_index),
+        "decision_threshold": decision_threshold,
+        "true_negatives": true_negatives,
+        "false_positives": false_positives,
+        "false_negatives": false_negatives,
+        "true_positives": true_positives,
+    }
+
+
+def select_validation_threshold(
+    results: list[TestResult],
+    *,
+    ad_index: int,
+) -> float:
+    """Select the threshold with best validation balanced accuracy."""
+
+    positive_count = sum(result.target == ad_index for result in results)
+    negative_count = len(results) - positive_count
+    if not positive_count or not negative_count:
+        raise ValueError("Threshold calibration requires both AD and NC samples")
+
+    ordered = sorted(
+        results,
+        key=lambda result: result.ad_probability,
+        reverse=True,
+    )
+    true_positives = 0
+    false_positives = 0
+    best_score = (-1.0, -1.0, float("-inf"))
+    best_threshold = 0.5
+    index = 0
+    while index < len(ordered):
+        threshold = ordered[index].ad_probability
+        end = index
+        while (
+            end < len(ordered)
+            and ordered[end].ad_probability == threshold
+        ):
+            if ordered[end].target == ad_index:
+                true_positives += 1
+            else:
+                false_positives += 1
+            end += 1
+
+        recall = true_positives / positive_count
+        specificity = (negative_count - false_positives) / negative_count
+        balanced_accuracy = (recall + specificity) / 2
+        accuracy = (
+            true_positives + negative_count - false_positives
+        ) / len(ordered)
+        score = (balanced_accuracy, accuracy, -abs(threshold - 0.5))
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+        index = end
+
+    return best_threshold
+
+
+def report_validation_results(
+    validation_loss: float,
+    results: list[TestResult],
+    *,
+    ad_index: int,
+    nc_index: int,
+    decision_threshold: float,
+) -> dict[str, Any]:
+    results = apply_decision_threshold(
+        results,
+        threshold=decision_threshold,
+        ad_index=ad_index,
+        nc_index=nc_index,
+    )
+    metrics = calculate_classification_metrics(
+        validation_loss,
+        results,
+        ad_index=ad_index,
+        nc_index=nc_index,
+        decision_threshold=decision_threshold,
+    )
+    print("\nSlice-level validation results (AD is the positive class)")
+    print(f"Decision threshold: {decision_threshold:.4f}")
+    print(f"Accuracy:           {metrics['accuracy']:.2%}")
+    print(f"Balanced accuracy:  {metrics['balanced_accuracy']:.2%}")
+    print(f"Precision:          {metrics['precision']:.2%}")
+    print(f"Recall:             {metrics['recall']:.2%}")
+    print(f"Specificity:        {metrics['specificity']:.2%}")
+    print(f"F1 score:           {metrics['f1']:.2%}")
+    print(f"ROC-AUC:            {metrics['roc_auc']:.4f}")
+    return metrics
+
+
 def print_examples(
     title: str,
     examples: list[TestResult],
@@ -520,25 +733,27 @@ def report_test_results(
     nc_index: int,
     idx_to_class: dict[int, str],
     output_dir: Path,
+    decision_threshold: float = 0.5,
 ) -> dict[str, Any]:
     """Print test metrics and optionally save a confusion-matrix figure."""
 
-    true_positives = sum(
-        result.prediction == ad_index and result.target == ad_index
-        for result in results
+    results = apply_decision_threshold(
+        results,
+        threshold=decision_threshold,
+        ad_index=ad_index,
+        nc_index=nc_index,
     )
-    false_positives = sum(
-        result.prediction == ad_index and result.target == nc_index
-        for result in results
+    metrics = calculate_classification_metrics(
+        test_loss,
+        results,
+        ad_index=ad_index,
+        nc_index=nc_index,
+        decision_threshold=decision_threshold,
     )
-    false_negatives = sum(
-        result.prediction == nc_index and result.target == ad_index
-        for result in results
-    )
-    true_negatives = sum(
-        result.prediction == nc_index and result.target == nc_index
-        for result in results
-    )
+    true_positives = metrics["true_positives"]
+    false_positives = metrics["false_positives"]
+    false_negatives = metrics["false_negatives"]
+    true_negatives = metrics["true_negatives"]
 
     correct = [result for result in results if result.prediction == result.target]
     false_positive_examples = [
@@ -552,29 +767,20 @@ def report_test_results(
         if result.prediction == nc_index and result.target == ad_index
     ]
 
-    accuracy = safe_divide(true_positives + true_negatives, len(results))
-    precision = safe_divide(true_positives, true_positives + false_positives)
-    recall = safe_divide(true_positives, true_positives + false_negatives)
-    f1 = safe_divide(2 * precision * recall, precision + recall)
-
-    metrics = {
-        "loss": test_loss,
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "true_negatives": true_negatives,
-        "false_positives": false_positives,
-        "false_negatives": false_negatives,
-        "true_positives": true_positives,
-    }
+    accuracy = metrics["accuracy"]
+    precision = metrics["precision"]
+    recall = metrics["recall"]
+    f1 = metrics["f1"]
 
     print("\nSlice-level test results (AD is the positive class)")
+    print(f"Decision threshold: {decision_threshold:.4f}")
     print(f"Loss:      {test_loss:.4f}")
     print(f"Accuracy:  {accuracy:.2%} ({len(correct)}/{len(results)})")
     print(f"Precision: {precision:.2%}")
     print(f"Recall:    {recall:.2%}")
+    print(f"Specificity: {metrics['specificity']:.2%}")
     print(f"F1 score:  {f1:.2%}")
+    print(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
 
     print("\nSlice-level test confusion matrix")
     print("                    Predicted NC  Predicted AD")
@@ -680,6 +886,8 @@ def main() -> None:
             scale_jitter=args.scale_jitter,
             intensity_jitter=args.intensity_jitter,
             noise_standard_deviation=args.noise_standard_deviation,
+            horizontal_flip_probability=args.horizontal_flip_probability,
+            gamma_jitter=args.gamma_jitter,
         )
 
     device = torch.device(
@@ -726,6 +934,10 @@ def main() -> None:
         seed=args.seed,
         training_seed=training_seed,
         training_slices_per_scan=args.slices_per_scan_per_epoch,
+        split_level=args.split_level,
+        metadata_path=args.metadata_path,
+        normalization=args.normalization,
+        balance_patients=args.balance_patients,
         image_size=loader_image_size,
         train_transform=training_transform,
         evaluation_transform=evaluation_transform,
@@ -765,6 +977,10 @@ def main() -> None:
     print(f"Training scans: {training_dataset.subject_count}")
     print(f"Validation scans: {validation_loader.dataset.subject_count}")
     print(f"Test scans: {test_loader.dataset.subject_count}")
+    if args.split_level == "patient" or args.balance_patients:
+        print(f"Training patients: {training_dataset.patient_count}")
+        print(f"Validation patients: {validation_loader.dataset.patient_count}")
+        print(f"Test patients: {test_loader.dataset.patient_count}")
     print(f"Training slices available: {len(training_dataset)}")
     print(f"Training slices selected per epoch: {len(train_loader.sampler)}")
     print(f"Validation slices: {len(validation_loader.dataset)}")
@@ -774,10 +990,20 @@ def main() -> None:
         print("Input preprocessing: resize complete 224x224 foreground crop")
     else:
         print(f"Input preprocessing: fixed {args.image_size}x{args.image_size} crop")
+    if args.normalization == "per-slice":
+        print(
+            "Input normalization: per-slice foreground mean and "
+            "standard deviation"
+        )
+    else:
+        print(
+            f"Training foreground statistics: mean "
+            f"{training_dataset.foreground_mean:.4f}, standard deviation "
+            f"{training_dataset.foreground_standard_deviation:.4f}"
+        )
     print(
-        f"Training foreground statistics: mean "
-        f"{training_dataset.foreground_mean:.4f}, standard deviation "
-        f"{training_dataset.foreground_standard_deviation:.4f}"
+        f"Validation split level: {args.split_level}; "
+        f"patient-balanced sampling: {args.balance_patients}"
     )
     print(f"Trainable parameters: {trainable_parameters:,}")
     print(f"Split seed: {args.seed}; training seed: {training_seed}")
@@ -787,7 +1013,9 @@ def main() -> None:
             f"Training augmentation: rotation +/-{args.rotation_degrees:g} degrees; "
             f"translation {args.translation_fraction:.0%}; scale +/-"
             f"{args.scale_jitter:.0%}; intensity +/-{args.intensity_jitter:.0%}; "
-            f"noise standard deviation {args.noise_standard_deviation:g}"
+            f"noise standard deviation {args.noise_standard_deviation:g}; "
+            f"horizontal flip {args.horizontal_flip_probability:.0%}; "
+            f"gamma +/-{args.gamma_jitter:.0%}"
         )
     else:
         print("Training augmentation: disabled")
@@ -800,11 +1028,40 @@ def main() -> None:
         f"Label smoothing: {args.label_smoothing:g}; "
         f"final test checkpoint: {checkpoint_description}"
     )
+    print(
+        "AD decision threshold: "
+        + (
+            "selected on validation balanced accuracy"
+            if args.calibrate_threshold
+            else "fixed at 0.5"
+        )
+    )
 
     if args.evaluate_only:
         print(f"Evaluation only; loading weights from: {test_weights_path}")
         model.load_state_dict(
             torch.load(test_weights_path, map_location=device, weights_only=True)
+        )
+        validation_loss, validation_results = infer_test_set(
+            model,
+            validation_loader,
+            evaluation_criterion,
+            device,
+            ad_index,
+            autocast_dtype,
+        )
+        decision_threshold = 0.5
+        if args.calibrate_threshold:
+            decision_threshold = select_validation_threshold(
+                validation_results,
+                ad_index=ad_index,
+            )
+        validation_report = report_validation_results(
+            validation_loss,
+            validation_results,
+            ad_index=ad_index,
+            nc_index=nc_index,
+            decision_threshold=decision_threshold,
         )
         test_loss, test_results = infer_test_set(
             model,
@@ -821,6 +1078,7 @@ def main() -> None:
             nc_index=nc_index,
             idx_to_class=idx_to_class,
             output_dir=args.output_dir,
+            decision_threshold=decision_threshold,
         )
         test_metrics_path = args.output_dir / "test_metrics.json"
         with test_metrics_path.open("w", encoding="utf-8") as metrics_file:
@@ -834,6 +1092,11 @@ def main() -> None:
                     "test_checkpoint": args.test_checkpoint,
                     "amp_dtype": args.amp_dtype,
                     "augment_training": args.augment_training,
+                    "split_level": args.split_level,
+                    "normalization": args.normalization,
+                    "balance_patients": args.balance_patients,
+                    "calibrate_threshold": args.calibrate_threshold,
+                    "decision_threshold": decision_threshold,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -841,6 +1104,7 @@ def main() -> None:
                     "seed": args.seed,
                     "training_seed": training_seed,
                     "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
+                    "validation": validation_report,
                     "test": test_metrics,
                 },
                 metrics_file,
@@ -1045,6 +1309,27 @@ def main() -> None:
     model.load_state_dict(
         torch.load(test_weights_path, map_location=device, weights_only=True)
     )
+    validation_loss, validation_results = infer_test_set(
+        model,
+        validation_loader,
+        evaluation_criterion,
+        device,
+        ad_index,
+        autocast_dtype,
+    )
+    decision_threshold = 0.5
+    if args.calibrate_threshold:
+        decision_threshold = select_validation_threshold(
+            validation_results,
+            ad_index=ad_index,
+        )
+    validation_report = report_validation_results(
+        validation_loss,
+        validation_results,
+        ad_index=ad_index,
+        nc_index=nc_index,
+        decision_threshold=decision_threshold,
+    )
     test_loss, test_results = infer_test_set(
         model,
         test_loader,
@@ -1060,6 +1345,7 @@ def main() -> None:
         nc_index=nc_index,
         idx_to_class=idx_to_class,
         output_dir=args.output_dir,
+        decision_threshold=decision_threshold,
     )
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
@@ -1070,6 +1356,11 @@ def main() -> None:
                     "batch_size": args.batch_size,
                     "image_size": list(image_size),
                     "input_mode": args.input_mode,
+                    "split_level": args.split_level,
+                    "normalization": args.normalization,
+                    "balance_patients": args.balance_patients,
+                    "calibrate_threshold": args.calibrate_threshold,
+                    "decision_threshold": decision_threshold,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -1087,6 +1378,10 @@ def main() -> None:
                     "scale_jitter": args.scale_jitter,
                     "intensity_jitter": args.intensity_jitter,
                     "noise_standard_deviation": args.noise_standard_deviation,
+                    "horizontal_flip_probability": (
+                        args.horizontal_flip_probability
+                    ),
+                    "gamma_jitter": args.gamma_jitter,
                     "warmup_epochs": args.warmup_epochs,
                     "plateau_patience": PLATEAU_PATIENCE,
                     "plateau_factor": PLATEAU_FACTOR,
@@ -1110,6 +1405,7 @@ def main() -> None:
                 "best_validation_accuracy": best_validation_accuracy,
                 "test_weights": str(test_weights_path),
                 "history": history,
+                "validation": validation_report,
                 "test": test_metrics,
             },
             metrics_file,
