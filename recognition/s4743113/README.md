@@ -112,6 +112,14 @@ increasing the resized input to 96×96. It uses `bfloat16` on the A100 and stops
 immediately if a loss or gradient becomes non-finite. Run it with
 `sbatch train_convnext_regularized_96.sh`.
 
+## MRI augmentation experiment
+
+`train_augmented.py` returns to 64×64 inputs and keeps ConvNeXt-Tiny unchanged.
+Training slices receive small random rotations, translations, scaling,
+intensity variation and Gaussian noise before normalization. Validation and
+test preprocessing remains deterministic. Run it with
+`sbatch train_convnext_augmented.sh`.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
