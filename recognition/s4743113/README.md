@@ -97,6 +97,15 @@ resized to 64×64 reached 100% training accuracy; the resized version learned
 faster, so the pilot uses it. Full validation loss and accuracy are reported
 after every epoch. Run it with `sbatch train_convnext_small_input.sh`.
 
+The original 224×224, batch-48 run made only about 359 optimizer updates per
+epoch, compared with 2,153 at batch 8. The smaller input also removes fine
+scanner-specific detail and makes each receptive field cover more of the
+brain. A 96×96, batch-8 run later reached 100% training accuracy but
+generalised worse than 64×64, suggesting that batch 8 improved optimization
+while the lower resolution also acted as useful regularisation. Because image
+size and batch size changed together initially, their effects were not fully
+isolated.
+
 ## Regularised small-input experiment
 
 The 64×64 run reached 100% training and 80.53% validation accuracy but
