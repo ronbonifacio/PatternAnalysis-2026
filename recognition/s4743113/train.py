@@ -41,6 +41,7 @@ PLATEAU_PATIENCE = 5
 PLATEAU_FACTOR = 0.5
 PLATEAU_MIN_LR = 1e-6
 COSINE_MIN_LR = 1e-6
+FOREGROUND_THRESHOLD = 10 / 255
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,12 @@ def parse_args() -> argparse.Namespace:
         default="float16",
         help="CUDA compute precision; float32 disables autocasting.",
     )
+    parser.add_argument("--augment-training", action="store_true")
+    parser.add_argument("--rotation-degrees", type=float, default=5.0)
+    parser.add_argument("--translation-fraction", type=float, default=0.05)
+    parser.add_argument("--scale-jitter", type=float, default=0.05)
+    parser.add_argument("--intensity-jitter", type=float, default=0.10)
+    parser.add_argument("--noise-standard-deviation", type=float, default=0.01)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
     parser.add_argument(
         "--learning-rate-scheduler",
@@ -151,6 +158,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--stochastic-depth must be in [0, 1)")
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error("--label-smoothing must be in [0, 1)")
+    if args.rotation_degrees < 0:
+        parser.error("--rotation-degrees cannot be negative")
+    if not 0.0 <= args.translation_fraction < 1.0:
+        parser.error("--translation-fraction must be in [0, 1)")
+    if not 0.0 <= args.scale_jitter < 1.0:
+        parser.error("--scale-jitter must be in [0, 1)")
+    if not 0.0 <= args.intensity_jitter < 1.0:
+        parser.error("--intensity-jitter must be in [0, 1)")
+    if args.noise_standard_deviation < 0:
+        parser.error("--noise-standard-deviation cannot be negative")
     if args.warmup_epochs < 0:
         parser.error("--warmup-epochs cannot be negative")
     if args.gradient_clip <= 0:
@@ -180,6 +197,95 @@ def resize_tensor_image(image: torch.Tensor, *, size: int) -> torch.Tensor:
         align_corners=False,
         antialias=True,
     ).squeeze(0)
+
+
+class MRITrainAugmentation:
+    """Apply mild spatial and intensity variation to one training slice."""
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        rotation_degrees: float,
+        translation_fraction: float,
+        scale_jitter: float,
+        intensity_jitter: float,
+        noise_standard_deviation: float,
+    ) -> None:
+        self.size = size
+        self.rotation_degrees = rotation_degrees
+        self.translation_fraction = translation_fraction
+        self.scale_jitter = scale_jitter
+        self.intensity_jitter = intensity_jitter
+        self.noise_standard_deviation = noise_standard_deviation
+
+    @staticmethod
+    def _uniform(low: float, high: float) -> float:
+        return torch.empty(()).uniform_(low, high).item()
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        image = resize_tensor_image(image, size=self.size)
+
+        angle = math.radians(
+            self._uniform(-self.rotation_degrees, self.rotation_degrees)
+        )
+        desired_scale = self._uniform(
+            1.0 - self.scale_jitter,
+            1.0 + self.scale_jitter,
+        )
+        translation_x = 2.0 * self._uniform(
+            -self.translation_fraction,
+            self.translation_fraction,
+        )
+        translation_y = 2.0 * self._uniform(
+            -self.translation_fraction,
+            self.translation_fraction,
+        )
+        cosine = math.cos(angle) / desired_scale
+        sine = math.sin(angle) / desired_scale
+        theta = image.new_tensor(
+            [
+                [cosine, -sine, translation_x],
+                [sine, cosine, translation_y],
+            ]
+        ).unsqueeze(0)
+        grid = F.affine_grid(
+            theta,
+            size=(1, image.shape[0], self.size, self.size),
+            align_corners=False,
+        )
+        image = F.grid_sample(
+            image.unsqueeze(0),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).squeeze(0)
+
+        foreground = image.amax(dim=0, keepdim=True) > FOREGROUND_THRESHOLD
+        foreground_values = image.masked_select(foreground.expand_as(image))
+        if foreground_values.numel():
+            foreground_mean = foreground_values.mean()
+            contrast = self._uniform(
+                1.0 - self.intensity_jitter,
+                1.0 + self.intensity_jitter,
+            )
+            gain = self._uniform(
+                1.0 - self.intensity_jitter,
+                1.0 + self.intensity_jitter,
+            )
+            image = (image - foreground_mean) * contrast + foreground_mean
+            image = image * gain
+            if self.noise_standard_deviation:
+                noise = torch.randn(
+                    (1, self.size, self.size),
+                    dtype=image.dtype,
+                    device=image.device,
+                ) * self.noise_standard_deviation
+                image = image + noise
+            image = torch.where(foreground, image.clamp(0.0, 1.0), 0.0)
+
+        return image
 
 
 def run_epoch(
@@ -561,10 +667,20 @@ def main() -> None:
     set_seed(training_seed)
     image_size = (args.image_size, args.image_size)
     loader_image_size = image_size
-    input_transform = None
+    evaluation_transform = None
     if args.input_mode == "resize":
         loader_image_size = FULL_FOREGROUND_CROP_SIZE
-        input_transform = partial(resize_tensor_image, size=args.image_size)
+        evaluation_transform = partial(resize_tensor_image, size=args.image_size)
+    training_transform = evaluation_transform
+    if args.augment_training:
+        training_transform = MRITrainAugmentation(
+            size=args.image_size,
+            rotation_degrees=args.rotation_degrees,
+            translation_fraction=args.translation_fraction,
+            scale_jitter=args.scale_jitter,
+            intensity_jitter=args.intensity_jitter,
+            noise_standard_deviation=args.noise_standard_deviation,
+        )
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -611,8 +727,8 @@ def main() -> None:
         training_seed=training_seed,
         training_slices_per_scan=args.slices_per_scan_per_epoch,
         image_size=loader_image_size,
-        train_transform=input_transform,
-        evaluation_transform=input_transform,
+        train_transform=training_transform,
+        evaluation_transform=evaluation_transform,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -666,6 +782,15 @@ def main() -> None:
     print(f"Trainable parameters: {trainable_parameters:,}")
     print(f"Split seed: {args.seed}; training seed: {training_seed}")
     print(f"CUDA compute precision: {args.amp_dtype}")
+    if args.augment_training:
+        print(
+            f"Training augmentation: rotation +/-{args.rotation_degrees:g} degrees; "
+            f"translation {args.translation_fraction:.0%}; scale +/-"
+            f"{args.scale_jitter:.0%}; intensity +/-{args.intensity_jitter:.0%}; "
+            f"noise standard deviation {args.noise_standard_deviation:g}"
+        )
+    else:
+        print("Training augmentation: disabled")
     checkpoint_description = (
         "last"
         if args.test_checkpoint == "last"
@@ -708,6 +833,7 @@ def main() -> None:
                     "label_smoothing": args.label_smoothing,
                     "test_checkpoint": args.test_checkpoint,
                     "amp_dtype": args.amp_dtype,
+                    "augment_training": args.augment_training,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -955,6 +1081,12 @@ def main() -> None:
                     "label_smoothing": args.label_smoothing,
                     "test_checkpoint": args.test_checkpoint,
                     "amp_dtype": args.amp_dtype,
+                    "augment_training": args.augment_training,
+                    "rotation_degrees": args.rotation_degrees,
+                    "translation_fraction": args.translation_fraction,
+                    "scale_jitter": args.scale_jitter,
+                    "intensity_jitter": args.intensity_jitter,
+                    "noise_standard_deviation": args.noise_standard_deviation,
                     "warmup_epochs": args.warmup_epochs,
                     "plateau_patience": PLATEAU_PATIENCE,
                     "plateau_factor": PLATEAU_FACTOR,
