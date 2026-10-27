@@ -543,7 +543,10 @@ def create_adni_slice_dataloaders(
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
-        "persistent_workers": num_workers > 0,
+        # Training, validation and testing use separate loaders. Do not keep
+        # one loader's workers alive while the next loader starts another
+        # worker pool, as this can exceed the Slurm job's host-memory limit.
+        "persistent_workers": False,
         "worker_init_fn": _seed_worker,
     }
     training_sampler = None
