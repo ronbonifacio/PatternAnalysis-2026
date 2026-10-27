@@ -129,6 +129,27 @@ intensity variation and Gaussian noise before normalization. Validation and
 test preprocessing remains deterministic. Run it with
 `sbatch train_convnext_augmented.sh`.
 
+## Validation split finding
+
+The split contains no repeated scans or images, but metadata showed that 109
+patients have different scans in both training and validation. This overlap is
+class-skewed: 95 of 101 validation AD scans are from patients seen during
+training, compared with only 104 of 223 test AD scans. This likely inflated
+validation accuracy to 88.70% while test accuracy reached 72.66% with 57.22%
+AD recall. Future model selection should use a diagnosis-stratified,
+patient-grouped validation split while retaining slice-level classification
+and the supplied test set.
+
+## Generalisation experiment
+
+`train_generalized.py` keeps ConvNeXt-Tiny and 64×64 slice classification but
+uses a diagnosis-stratified patient split, balances diagnoses and patients
+within each training epoch, and normalizes each slice from its own brain
+foreground. Training also adds horizontal flips and mild gamma variation. The
+AD threshold is selected using validation balanced accuracy before test
+inference. Run it with `sbatch train_convnext_generalized.sh`; the Slurm job is
+capped at three hours and retains early stopping.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
