@@ -52,11 +52,12 @@ class ADNISample:
 
 @dataclass(frozen=True)
 class ADNISlice:
-    """One labelled MRI slice belonging to an ADNI sample."""
+    """One labelled MRI slice and its within-scan context."""
 
     sample_id: str
     label: int
     path: Path
+    context_paths: tuple[Path, Path, Path]
     slice_index: int
     patient_id: str
 
@@ -358,6 +359,7 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         *,
         foreground_statistics: tuple[float, float] | None = None,
         normalize_per_slice: bool = False,
+        slice_context: int = 1,
         transform: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
         self.class_to_idx = dict(subject_dataset.class_to_idx)
@@ -365,7 +367,11 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         self.excluded_sample_ids = subject_dataset.excluded_sample_ids
         self.foreground_statistics = foreground_statistics
         self.normalize_per_slice = normalize_per_slice
+        self.slice_context = slice_context
         self.transform = transform
+
+        if slice_context not in {1, 3}:
+            raise ValueError("slice_context must be 1 or 3")
 
         if foreground_statistics is not None and normalize_per_slice:
             raise ValueError(
@@ -404,19 +410,22 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         self.slices: list[ADNISlice] = []
         for subject_index in selected_indices:
             sample = subject_dataset.samples[subject_index]
-            self.slices.extend(
-                ADNISlice(
-                    sample_id=sample.sample_id,
-                    label=sample.label,
-                    path=path,
-                    slice_index=slice_index,
-                    patient_id=sample.patient_id,
+            final_position = len(sample.slice_paths) - 1
+            for position, (path, slice_index) in enumerate(
+                zip(sample.slice_paths, sample.slice_indices)
+            ):
+                previous_path = sample.slice_paths[max(position - 1, 0)]
+                next_path = sample.slice_paths[min(position + 1, final_position)]
+                self.slices.append(
+                    ADNISlice(
+                        sample_id=sample.sample_id,
+                        label=sample.label,
+                        path=path,
+                        context_paths=(previous_path, path, next_path),
+                        slice_index=slice_index,
+                        patient_id=sample.patient_id,
+                    )
                 )
-                for path, slice_index in zip(
-                    sample.slice_paths,
-                    sample.slice_indices,
-                )
-            )
 
     @property
     def classes(self) -> list[str]:
@@ -440,35 +449,49 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
 
     def __getitem__(self, index: int) -> dict[str, object]:
         item = self.slices[index]
-        image = _image_to_tensor(item.path, self.image_size)
+        if self.slice_context == 3:
+            # ConvNeXt still receives three channels, but they now contain
+            # the previous, centre and next grayscale MRI slices instead of
+            # three copies of the centre slice. Context never crosses a scan.
+            image = torch.stack(
+                [
+                    _image_to_tensor(path, self.image_size)[0]
+                    for path in item.context_paths
+                ]
+            )
+        else:
+            image = _image_to_tensor(item.path, self.image_size)
         if self.transform is not None:
             image = self.transform(image)
-        foreground = image.amax(dim=0, keepdim=True) > _FOREGROUND_THRESHOLD
+        foreground = image > _FOREGROUND_THRESHOLD
         if self.normalize_per_slice:
-            foreground_values = image[0].masked_select(foreground[0])
-            if foreground_values.numel() == 0:
-                # Some supplied ADNI slices are completely black. They have
-                # no intensity distribution to standardize, so retain them as
-                # a finite, neutral all-zero input instead of aborting an
-                # otherwise valid training epoch.
-                image = torch.zeros_like(image)
-            else:
-                foreground_mean = foreground_values.mean()
-                foreground_standard_deviation = foreground_values.std(
-                    unbiased=False
-                )
-                minimum_standard_deviation = torch.finfo(image.dtype).eps
-                if foreground_standard_deviation <= minimum_standard_deviation:
-                    # A constant-valued foreground likewise contains no
-                    # contrast information and is represented neutrally.
-                    image = torch.zeros_like(image)
+            normalized_channels = []
+            for channel, channel_foreground in zip(image, foreground):
+                foreground_values = channel.masked_select(channel_foreground)
+                if foreground_values.numel() == 0:
+                    # Completely black or constant slices contain no usable
+                    # contrast and are represented by a neutral zero channel.
+                    normalized_channel = torch.zeros_like(channel)
                 else:
-                    image = torch.where(
-                        foreground,
-                        (image - foreground_mean)
-                        / foreground_standard_deviation,
-                        0.0,
+                    foreground_mean = foreground_values.mean()
+                    foreground_standard_deviation = foreground_values.std(
+                        unbiased=False
                     )
+                    minimum_standard_deviation = torch.finfo(image.dtype).eps
+                    if (
+                        foreground_standard_deviation
+                        <= minimum_standard_deviation
+                    ):
+                        normalized_channel = torch.zeros_like(channel)
+                    else:
+                        normalized_channel = torch.where(
+                            channel_foreground,
+                            (channel - foreground_mean)
+                            / foreground_standard_deviation,
+                            0.0,
+                        )
+                normalized_channels.append(normalized_channel)
+            image = torch.stack(normalized_channels)
         elif self.foreground_statistics is not None:
             image = torch.where(
                 foreground,
@@ -672,6 +695,7 @@ def create_adni_slice_dataloaders(
     split_level: str = "scan",
     metadata_path: str | Path | None = None,
     normalization: str = "training",
+    slice_context: int = 1,
     balance_patients: bool = False,
     excluded_sample_ids: Sequence[str] = (),
     image_size: tuple[int, int] | None = (224, 224),
@@ -684,7 +708,8 @@ def create_adni_slice_dataloaders(
 
     Groups are split before their records are flattened into individual
     slices. A patient-level split additionally keeps repeat scans from one
-    patient together. ConvNeXt still receives one 2D slice and label per item.
+    patient together. With three-slice context, adjacent slices are assembled
+    only after splitting and always come from the centre slice's scan.
     """
 
     if batch_size <= 0:
@@ -699,6 +724,8 @@ def create_adni_slice_dataloaders(
         raise ValueError("split_level must be 'scan' or 'patient'")
     if normalization not in {"training", "per-slice"}:
         raise ValueError("normalization must be 'training' or 'per-slice'")
+    if slice_context not in {1, 3}:
+        raise ValueError("slice_context must be 1 or 3")
     if training_slices_per_scan is not None and balance_patients:
         raise ValueError(
             "slice subsampling and patient balancing cannot both be enabled"
@@ -796,6 +823,7 @@ def create_adni_slice_dataloaders(
         training_indices,
         foreground_statistics=foreground_statistics,
         normalize_per_slice=normalize_per_slice,
+        slice_context=slice_context,
         transform=train_transform,
     )
     validation_slices = ADNISliceDataset(
@@ -803,12 +831,14 @@ def create_adni_slice_dataloaders(
         validation_indices,
         foreground_statistics=foreground_statistics,
         normalize_per_slice=normalize_per_slice,
+        slice_context=slice_context,
         transform=evaluation_transform,
     )
     test_slices = ADNISliceDataset(
         test_subjects,
         foreground_statistics=foreground_statistics,
         normalize_per_slice=normalize_per_slice,
+        slice_context=slice_context,
         transform=evaluation_transform,
     )
 

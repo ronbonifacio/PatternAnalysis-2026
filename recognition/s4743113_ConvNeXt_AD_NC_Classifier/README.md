@@ -161,9 +161,21 @@ use exponential moving-average model weights. Early stopping is retained and
 the best validation-loss weights are used for test inference. Run it with
 `sbatch train_convnext_mixup_ema.sh`.
 
+## 2.5D input experiment
+
+`train_2_5d.py` replaces the three duplicated grayscale channels with the
+previous, centre and next slices from the same scan. The centre slice keeps its
+original label and remains one test prediction, so no scan-level averaging is
+introduced. The first and last slices repeat their nearest available edge
+slice. Splitting still happens before triplets are created, preventing context
+from crossing training, validation or scan boundaries. The model and remaining
+MixUp/EMA settings are unchanged. Run it with
+`sbatch train_convnext_2_5d.sh`.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
 - [TorchVision ConvNeXt source](https://github.com/pytorch/vision/blob/main/torchvision/models/convnext.py)
 - [Official ConvNeXt training recipe](https://github.com/facebookresearch/ConvNeXt/blob/main/TRAINING.md)
 - [MixUp](https://openreview.net/pdf?id=r1Ddp1-Rb)
+- [Adjacent-slice 2.5D MRI classification](https://pmc.ncbi.nlm.nih.gov/articles/PMC13085064/)
