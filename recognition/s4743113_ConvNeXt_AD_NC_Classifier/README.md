@@ -150,7 +150,8 @@ flipping anatomical laterality. The AD threshold is selected using validation
 balanced accuracy before test inference. Scan `1012896` is excluded before
 splitting because its supplied slice `1012896_94.jpeg` has no usable
 foreground. Run it with `sbatch train_convnext_generalized.sh`; the Slurm job
-is capped at three hours and retains early stopping.
+is capped at three hours and runs all 100 cosine-scheduled epochs while saving
+the best validation-loss weights.
 
 ## References
 
