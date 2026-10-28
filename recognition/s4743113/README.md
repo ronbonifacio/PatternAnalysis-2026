@@ -145,12 +145,12 @@ and the supplied test set.
 `train_generalized.py` keeps ConvNeXt-Tiny and 64×64 slice classification but
 uses a diagnosis-stratified patient split, balances diagnoses and patients
 within each training epoch, and normalizes each slice from its own brain
-foreground. Training also adds horizontal flips and mild gamma variation. The
-AD threshold is selected using validation balanced accuracy before test
-inference. Scan `1012896` is excluded before splitting because its supplied
-slice `1012896_94.jpeg` has no usable foreground. Run it with
-`sbatch train_convnext_generalized.sh`; the Slurm job is capped at three hours
-and retains early stopping.
+foreground. Training uses mild spatial and intensity augmentation without
+flipping anatomical laterality. The AD threshold is selected using validation
+balanced accuracy before test inference. Scan `1012896` is excluded before
+splitting because its supplied slice `1012896_94.jpeg` has no usable
+foreground. Run it with `sbatch train_convnext_generalized.sh`; the Slurm job
+is capped at three hours and retains early stopping.
 
 ## References
 
