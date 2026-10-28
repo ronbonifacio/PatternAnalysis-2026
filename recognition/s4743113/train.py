@@ -136,6 +136,12 @@ def parse_args() -> argparse.Namespace:
         default="training",
     )
     parser.add_argument("--balance-patients", action="store_true")
+    parser.add_argument(
+        "--exclude-scan",
+        action="append",
+        default=[],
+        help="Scan ID to omit before splitting; may be supplied more than once.",
+    )
     parser.add_argument("--calibrate-threshold", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -938,6 +944,7 @@ def main() -> None:
         metadata_path=args.metadata_path,
         normalization=args.normalization,
         balance_patients=args.balance_patients,
+        excluded_sample_ids=args.exclude_scan,
         image_size=loader_image_size,
         train_transform=training_transform,
         evaluation_transform=evaluation_transform,
@@ -974,6 +981,11 @@ def main() -> None:
     )
     print(f"Device: {device}")
     print(f"Classes: {class_to_idx}")
+    if training_dataset.excluded_sample_ids:
+        print(
+            "Excluded training scans: "
+            + ", ".join(training_dataset.excluded_sample_ids)
+        )
     print(f"Training scans: {training_dataset.subject_count}")
     print(f"Validation scans: {validation_loader.dataset.subject_count}")
     print(f"Test scans: {test_loader.dataset.subject_count}")
@@ -1095,6 +1107,7 @@ def main() -> None:
                     "split_level": args.split_level,
                     "normalization": args.normalization,
                     "balance_patients": args.balance_patients,
+                    "excluded_scans": args.exclude_scan,
                     "calibrate_threshold": args.calibrate_threshold,
                     "decision_threshold": decision_threshold,
                     "foreground_mean": training_dataset.foreground_mean,
@@ -1359,6 +1372,7 @@ def main() -> None:
                     "split_level": args.split_level,
                     "normalization": args.normalization,
                     "balance_patients": args.balance_patients,
+                    "excluded_scans": args.exclude_scan,
                     "calibrate_threshold": args.calibrate_threshold,
                     "decision_threshold": decision_threshold,
                     "foreground_mean": training_dataset.foreground_mean,

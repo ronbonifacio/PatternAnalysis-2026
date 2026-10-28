@@ -37,6 +37,8 @@ if __name__ == "__main__":
         "patient",
         "--normalization",
         "per-slice",
+        "--exclude-scan",
+        "1012896",
         "--balance-patients",
         "--augment-training",
         "--rotation-degrees",
