@@ -51,8 +51,6 @@ if __name__ == "__main__":
         "0.10",
         "--noise-standard-deviation",
         "0.01",
-        "--horizontal-flip-probability",
-        "0.5",
         "--gamma-jitter",
         "0.2",
         "--learning-rate-scheduler",
