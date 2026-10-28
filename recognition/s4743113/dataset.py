@@ -226,9 +226,11 @@ class ADNISubjectIndex:
         class_to_idx: Mapping[str, int] | None = None,
         image_size: tuple[int, int] | None = (224, 224),
         patient_ids: Mapping[str, str] | None = None,
+        excluded_sample_ids: Sequence[str] = (),
     ) -> None:
         self.split_dir = Path(split_dir)
         self.image_size = image_size
+        excluded_ids = {str(sample_id) for sample_id in excluded_sample_ids}
 
         if not self.split_dir.is_dir():
             raise FileNotFoundError(f"Dataset split does not exist: {self.split_dir}")
@@ -243,6 +245,7 @@ class ADNISubjectIndex:
 
         class_names: set[str] = set()
         parsed: list[tuple[Path, str, str, int]] = []
+        found_excluded_ids: set[str] = set()
         for path in image_paths:
             relative = path.relative_to(self.split_dir)
             if len(relative.parts) < 2:
@@ -261,8 +264,17 @@ class ADNISubjectIndex:
             class_name = relative.parts[0]
             sample_id = match.group("sample")
             slice_index = int(match.group("slice"))
+            if sample_id in excluded_ids:
+                found_excluded_ids.add(sample_id)
+                continue
             class_names.add(class_name)
             parsed.append((path, class_name, sample_id, slice_index))
+
+        if not parsed:
+            raise ValueError(
+                f"No usable JPEG images remain inside {self.split_dir}"
+            )
+        self.excluded_sample_ids = tuple(sorted(found_excluded_ids))
 
         if class_to_idx is None:
             self.class_to_idx = {
@@ -350,6 +362,7 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
     ) -> None:
         self.class_to_idx = dict(subject_dataset.class_to_idx)
         self.image_size = subject_dataset.image_size
+        self.excluded_sample_ids = subject_dataset.excluded_sample_ids
         self.foreground_statistics = foreground_statistics
         self.normalize_per_slice = normalize_per_slice
         self.transform = transform
@@ -434,18 +447,28 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         if self.normalize_per_slice:
             foreground_values = image[0].masked_select(foreground[0])
             if foreground_values.numel() == 0:
-                raise RuntimeError(f"Image {item.path} contains no foreground")
-            foreground_mean = foreground_values.mean()
-            foreground_standard_deviation = foreground_values.std(unbiased=False)
-            if foreground_standard_deviation <= 0:
-                raise RuntimeError(
-                    f"Image {item.path} has zero foreground standard deviation"
+                # Some supplied ADNI slices are completely black. They have
+                # no intensity distribution to standardize, so retain them as
+                # a finite, neutral all-zero input instead of aborting an
+                # otherwise valid training epoch.
+                image = torch.zeros_like(image)
+            else:
+                foreground_mean = foreground_values.mean()
+                foreground_standard_deviation = foreground_values.std(
+                    unbiased=False
                 )
-            image = torch.where(
-                foreground,
-                (image - foreground_mean) / foreground_standard_deviation,
-                0.0,
-            )
+                minimum_standard_deviation = torch.finfo(image.dtype).eps
+                if foreground_standard_deviation <= minimum_standard_deviation:
+                    # A constant-valued foreground likewise contains no
+                    # contrast information and is represented neutrally.
+                    image = torch.zeros_like(image)
+                else:
+                    image = torch.where(
+                        foreground,
+                        (image - foreground_mean)
+                        / foreground_standard_deviation,
+                        0.0,
+                    )
         elif self.foreground_statistics is not None:
             image = torch.where(
                 foreground,
@@ -650,6 +673,7 @@ def create_adni_slice_dataloaders(
     metadata_path: str | Path | None = None,
     normalization: str = "training",
     balance_patients: bool = False,
+    excluded_sample_ids: Sequence[str] = (),
     image_size: tuple[int, int] | None = (224, 224),
     train_transform: Callable[[Tensor], Tensor] | None = None,
     evaluation_transform: Callable[[Tensor], Tensor] | None = None,
@@ -707,12 +731,14 @@ def create_adni_slice_dataloaders(
         train_dir,
         image_size=image_size,
         patient_ids=patient_ids,
+        excluded_sample_ids=excluded_sample_ids,
     )
     test_subjects = ADNISubjectIndex(
         test_dir,
         class_to_idx=training_subjects.class_to_idx,
         image_size=image_size,
         patient_ids=patient_ids,
+        excluded_sample_ids=excluded_sample_ids,
     )
 
     training_identities = {

@@ -147,8 +147,10 @@ uses a diagnosis-stratified patient split, balances diagnoses and patients
 within each training epoch, and normalizes each slice from its own brain
 foreground. Training also adds horizontal flips and mild gamma variation. The
 AD threshold is selected using validation balanced accuracy before test
-inference. Run it with `sbatch train_convnext_generalized.sh`; the Slurm job is
-capped at three hours and retains early stopping.
+inference. Scan `1012896` is excluded before splitting because its supplied
+slice `1012896_94.jpeg` has no usable foreground. Run it with
+`sbatch train_convnext_generalized.sh`; the Slurm job is capped at three hours
+and retains early stopping.
 
 ## References
 
