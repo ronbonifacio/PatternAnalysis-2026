@@ -300,7 +300,7 @@ def create_adni_dataloaders(
     set_seed(seed)
     # Anchor the default to this source file, not to whichever directory was
     # active when Python/Jupyter was launched.  This remains portable if the
-    # whole s4743113 directory is moved.
+    # whole project directory is moved.
     data_path = (
         Path(__file__).resolve().parent / "data"
         if data_dir is None
