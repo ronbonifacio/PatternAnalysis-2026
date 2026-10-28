@@ -78,6 +78,16 @@ def parse_args() -> argparse.Namespace:
             "the complete 224-pixel foreground crop and resize it."
         ),
     )
+    parser.add_argument(
+        "--slice-context",
+        type=int,
+        choices=(1, 3),
+        default=1,
+        help=(
+            "Use one slice replicated over RGB channels, or use the previous, "
+            "centre and next slices as a 2.5D three-channel input."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
@@ -1019,6 +1029,7 @@ def main() -> None:
         split_level=args.split_level,
         metadata_path=args.metadata_path,
         normalization=args.normalization,
+        slice_context=args.slice_context,
         balance_patients=args.balance_patients,
         excluded_sample_ids=args.exclude_scan,
         image_size=loader_image_size,
@@ -1074,6 +1085,10 @@ def main() -> None:
     print(f"Validation slices: {len(validation_loader.dataset)}")
     print(f"Test slices: {len(test_loader.dataset)}")
     print(f"Model input size: {args.image_size}x{args.image_size}")
+    if args.slice_context == 3:
+        print("Input channels: previous, centre and next slice (2.5D)")
+    else:
+        print("Input channels: centre slice copied across three channels (2D)")
     if args.input_mode == "resize":
         print("Input preprocessing: resize complete 224x224 foreground crop")
     else:
@@ -1176,6 +1191,7 @@ def main() -> None:
                     "batch_size": args.batch_size,
                     "image_size": list(image_size),
                     "input_mode": args.input_mode,
+                    "slice_context": args.slice_context,
                     "label_smoothing": args.label_smoothing,
                     "mixup_alpha": args.mixup_alpha,
                     "ema_decay": args.ema_decay,
@@ -1468,6 +1484,7 @@ def main() -> None:
                     "batch_size": args.batch_size,
                     "image_size": list(image_size),
                     "input_mode": args.input_mode,
+                    "slice_context": args.slice_context,
                     "split_level": args.split_level,
                     "normalization": args.normalization,
                     "balance_patients": args.balance_patients,
