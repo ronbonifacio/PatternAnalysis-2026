@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -81,6 +82,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--stochastic-depth", type=float, default=0.0)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=0.0,
+        help="Beta-distribution alpha for batch MixUp; zero disables MixUp.",
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.0,
+        help="Model-weight EMA decay; zero disables EMA.",
+    )
     parser.add_argument(
         "--amp-dtype",
         choices=("float16", "bfloat16", "float32"),
@@ -179,6 +192,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--stochastic-depth must be in [0, 1)")
     if not 0.0 <= args.label_smoothing < 1.0:
         parser.error("--label-smoothing must be in [0, 1)")
+    if args.mixup_alpha < 0:
+        parser.error("--mixup-alpha cannot be negative")
+    if not 0.0 <= args.ema_decay < 1.0:
+        parser.error("--ema-decay must be in [0, 1)")
     if args.rotation_degrees < 0:
         parser.error("--rotation-degrees cannot be negative")
     if not 0.0 <= args.translation_fraction < 1.0:
@@ -328,6 +345,33 @@ class MRITrainAugmentation:
         return image
 
 
+class ModelEMA:
+    """Maintain an exponential moving average of model parameters."""
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError("EMA decay must be between zero and one")
+        self.module = copy.deepcopy(model).eval()
+        self.module.requires_grad_(False)
+        self.decay = decay
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Blend the latest trained parameters into the averaged model."""
+
+        model_parameters = dict(model.named_parameters())
+        for name, averaged_parameter in self.module.named_parameters():
+            current_parameter = model_parameters[name].detach()
+            averaged_parameter.mul_(self.decay).add_(
+                current_parameter,
+                alpha=1.0 - self.decay,
+            )
+
+        model_buffers = dict(model.named_buffers())
+        for name, averaged_buffer in self.module.named_buffers():
+            averaged_buffer.copy_(model_buffers[name])
+
+
 def run_epoch(
     model: ConvNeXt,
     loader: DataLoader,
@@ -338,6 +382,8 @@ def run_epoch(
     scaler: torch.amp.GradScaler | None = None,
     gradient_clip: float | None = None,
     autocast_dtype: torch.dtype | None = torch.float16,
+    mixup_alpha: float = 0.0,
+    model_ema: ModelEMA | None = None,
 ) -> EpochMetrics:
     """Run one training or validation epoch and return slice-level metrics."""
 
@@ -347,12 +393,25 @@ def run_epoch(
     use_amp = is_cuda and autocast_dtype is not None
 
     total_loss = 0.0
-    total_correct = 0
+    total_correct = 0.0
     total_slices = 0
 
     for batch_index, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=is_cuda)
         labels = batch["label"].to(device, non_blocking=is_cuda)
+        paired_labels = None
+        mixup_weight = 1.0
+        if is_training and mixup_alpha > 0.0 and labels.size(0) > 1:
+            mixup_weight = torch.distributions.Beta(
+                mixup_alpha,
+                mixup_alpha,
+            ).sample().item()
+            permutation = torch.randperm(labels.size(0), device=device)
+            paired_labels = labels[permutation]
+            images = (
+                mixup_weight * images
+                + (1.0 - mixup_weight) * images[permutation]
+            )
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -365,6 +424,12 @@ def run_epoch(
             ):
                 logits = model(images)
                 loss = criterion(logits, labels)
+                if paired_labels is not None:
+                    paired_loss = criterion(logits, paired_labels)
+                    loss = (
+                        mixup_weight * loss
+                        + (1.0 - mixup_weight) * paired_loss
+                    )
 
             if not torch.isfinite(loss).item():
                 phase = "training" if is_training else "validation"
@@ -394,10 +459,20 @@ def run_epoch(
                         )
                     scaler.step(optimizer)
                     scaler.update()
+                if model_ema is not None:
+                    model_ema.update(model)
 
         slice_count = labels.size(0)
         total_loss += loss.detach().item() * slice_count
-        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        predictions = logits.argmax(dim=1)
+        batch_correct = (predictions == labels).sum().item()
+        if paired_labels is not None:
+            paired_correct = (predictions == paired_labels).sum().item()
+            batch_correct = (
+                mixup_weight * batch_correct
+                + (1.0 - mixup_weight) * paired_correct
+            )
+        total_correct += batch_correct
         total_slices += slice_count
 
     if total_slices == 0:
@@ -920,6 +995,7 @@ def main() -> None:
         args.output_dir / "best_accuracy_model_weights.pt"
     )
     last_weights_path = args.output_dir / "last_model_weights.pt"
+    last_ema_weights_path = args.output_dir / "last_ema_model_weights.pt"
     metrics_path = args.output_dir / "metrics.json"
     checkpoint_paths = {
         "loss": best_weights_path,
@@ -1101,6 +1177,8 @@ def main() -> None:
                     "image_size": list(image_size),
                     "input_mode": args.input_mode,
                     "label_smoothing": args.label_smoothing,
+                    "mixup_alpha": args.mixup_alpha,
+                    "ema_decay": args.ema_decay,
                     "test_checkpoint": args.test_checkpoint,
                     "amp_dtype": args.amp_dtype,
                     "augment_training": args.augment_training,
@@ -1131,6 +1209,7 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    model_ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
     warmup_scheduler = None
     plateau_scheduler = None
     cosine_scheduler = None
@@ -1179,6 +1258,16 @@ def main() -> None:
         f"Stochastic depth: {args.stochastic_depth:g}; "
         f"gradient clipping: {args.gradient_clip:g}"
     )
+    print(
+        f"MixUp alpha: {args.mixup_alpha:g}; "
+        + (
+            f"EMA decay: {args.ema_decay:g}"
+            if model_ema is not None
+            else "EMA: disabled"
+        )
+    )
+    if model_ema is not None:
+        print("Validation and best checkpoints use EMA weights")
     if args.disable_early_stopping:
         print(f"Early stopping: disabled; training all {args.epochs} epochs")
     else:
@@ -1207,9 +1296,12 @@ def main() -> None:
             scaler=scaler,
             gradient_clip=args.gradient_clip,
             autocast_dtype=autocast_dtype,
+            mixup_alpha=args.mixup_alpha,
+            model_ema=model_ema,
         )
+        validation_model = model_ema.module if model_ema is not None else model
         validation_metrics = run_epoch(
-            model,
+            validation_model,
             validation_loader,
             evaluation_criterion,
             device,
@@ -1239,7 +1331,7 @@ def main() -> None:
             best_validation_loss = validation_metrics.loss
             best_epoch = epoch
             epochs_without_improvement = 0
-            torch.save(model.state_dict(), best_weights_path)
+            torch.save(validation_model.state_dict(), best_weights_path)
             print(
                 f"  Validation loss improved; saved weights to "
                 f"{best_weights_path}"
@@ -1269,7 +1361,10 @@ def main() -> None:
         if validation_metrics.accuracy > best_validation_accuracy:
             best_validation_accuracy = validation_metrics.accuracy
             best_accuracy_epoch = epoch
-            torch.save(model.state_dict(), best_accuracy_weights_path)
+            torch.save(
+                validation_model.state_dict(),
+                best_accuracy_weights_path,
+            )
             print(
                 f"  Validation accuracy improved; saved weights to "
                 f"{best_accuracy_weights_path}"
@@ -1308,6 +1403,8 @@ def main() -> None:
             break
 
     torch.save(model.state_dict(), last_weights_path)
+    if model_ema is not None:
+        torch.save(model_ema.module.state_dict(), last_ema_weights_path)
     print(f"Best epoch: {best_epoch} (validation loss {best_validation_loss:.4f})")
     print(f"Best weights saved to: {best_weights_path}")
     print(
@@ -1316,6 +1413,8 @@ def main() -> None:
     )
     print(f"Best-accuracy weights saved to: {best_accuracy_weights_path}")
     print(f"Final weights saved to: {last_weights_path}")
+    if model_ema is not None:
+        print(f"Final EMA weights saved to: {last_ema_weights_path}")
 
     test_weights_path = checkpoint_paths[args.test_checkpoint]
     print(f"Testing weights selected by {args.test_checkpoint}: {test_weights_path}")
@@ -1384,6 +1483,8 @@ def main() -> None:
                     "weight_decay": args.weight_decay,
                     "stochastic_depth": args.stochastic_depth,
                     "label_smoothing": args.label_smoothing,
+                    "mixup_alpha": args.mixup_alpha,
+                    "ema_decay": args.ema_decay,
                     "test_checkpoint": args.test_checkpoint,
                     "amp_dtype": args.amp_dtype,
                     "augment_training": args.augment_training,

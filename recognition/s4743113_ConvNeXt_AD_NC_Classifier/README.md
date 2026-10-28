@@ -153,7 +153,17 @@ foreground. Run it with `sbatch train_convnext_generalized.sh`; the Slurm job
 is capped at three hours and runs all 100 cosine-scheduled epochs while saving
 the best validation-loss weights.
 
+## MixUp and EMA experiment
+
+`train_mixup_ema.py` keeps the same slice-level model and patient split while
+adding batch MixUp to reduce memorisation. Validation and checkpoint selection
+use exponential moving-average model weights. Early stopping is retained and
+the best validation-loss weights are used for test inference. Run it with
+`sbatch train_convnext_mixup_ema.sh`.
+
 ## References
 
 - [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545)
 - [TorchVision ConvNeXt source](https://github.com/pytorch/vision/blob/main/torchvision/models/convnext.py)
+- [Official ConvNeXt training recipe](https://github.com/facebookresearch/ConvNeXt/blob/main/TRAINING.md)
+- [MixUp](https://openreview.net/pdf?id=r1Ddp1-Rb)
