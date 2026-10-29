@@ -13,6 +13,7 @@ import copy
 import json
 import math
 import os
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -30,7 +31,7 @@ from dataset import (
     resize_tensor_image,
     set_seed,
 )
-from modules import ConvNeXt, convnext_tiny
+from modules import convnext_tiny
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -293,7 +294,7 @@ class ModelEMA:
 
 
 def run_epoch(
-    model: ConvNeXt,
+    model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
@@ -459,7 +460,7 @@ def create_warmup_cosine_scheduler(
 
 
 def infer_test_set(
-    model: ConvNeXt,
+    model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
@@ -975,6 +976,8 @@ def report_target_recall_operating_point(
 def save_training_curves(
     history: list[dict[str, Any]],
     output_dir: Path,
+    *,
+    plot_title: str = "ConvNeXt Training History",
 ) -> Path:
     """Save train/validation loss and accuracy as a dependency-free SVG."""
 
@@ -1077,7 +1080,7 @@ def save_training_curves(
         f'height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#fafafa"/>',
         '<text x="500" y="25" text-anchor="middle" font-size="24" '
-        'font-weight="bold">ConvNeXt Training History</text>',
+        f'font-weight="bold">{plot_title}</text>',
     ]
     svg_elements.extend(
         panel(
@@ -1112,7 +1115,11 @@ def save_training_curves(
     return output_path
 
 
-def main() -> None:
+def main(
+    *,
+    model_factory: Callable[..., nn.Module] = convnext_tiny,
+    training_plot_title: str = "ConvNeXt Training History",
+) -> None:
     args = parse_args()
     training_seed = args.seed if args.training_seed is None else args.training_seed
     set_seed(training_seed)
@@ -1206,7 +1213,7 @@ def main() -> None:
     # Dataset construction uses the split seed. Restore the independent
     # training seed before model-weight initialization.
     set_seed(training_seed)
-    model = convnext_tiny(
+    model = model_factory(
         num_classes=len(class_to_idx),
         stochastic_depth_probability=args.stochastic_depth,
     ).to(device)
@@ -1514,7 +1521,11 @@ def main() -> None:
             }
         )
         # Refresh the plot every epoch so partial jobs still retain curves.
-        training_curves_path = save_training_curves(history, args.output_dir)
+        training_curves_path = save_training_curves(
+            history,
+            args.output_dir,
+            plot_title=training_plot_title,
+        )
 
         print(
             f"Epoch {epoch:03d}/{args.epochs} | "
