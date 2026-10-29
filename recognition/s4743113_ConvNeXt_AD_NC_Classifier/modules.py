@@ -15,10 +15,10 @@ The architecture follows ConvNeXt-Tiny from "A ConvNet for the 2020s" and the
 TorchVision reference implementation, but is assembled here from PyTorch
 layers instead of calling a prebuilt model.
 
-The active model follows TorchVision's ordinary forward pass: it accepts a
-batch of independent 2D MRI slices and produces one AD/NC prediction per
-slice. The earlier mean-pooling model is preserved separately in
-``modules_subject_level_superseded.py``.
+The active model follows TorchVision's ordinary forward pass. Its three input
+channels contain adjacent MRI slices and it produces one AD/NC prediction for
+the centre slice. The earlier mean-pooling model is preserved under
+``superseded/modules_subject_level_superseded.py``.
 
 References:
     https://arxiv.org/abs/2201.03545

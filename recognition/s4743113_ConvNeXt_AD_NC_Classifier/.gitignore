@@ -5,3 +5,4 @@ __pycache__/
 /output/convnext_tiny/
 /output/convnext_tiny_slice_level/
 /output/convnext_tiny_subject_superseded/
+/output/convnext_tiny_64px_2_5d_plateau/

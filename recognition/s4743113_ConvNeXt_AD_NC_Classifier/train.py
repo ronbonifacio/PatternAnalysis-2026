@@ -1,10 +1,10 @@
 # Prompt:
-# "Train the layer-by-layer convnext model on individual ADNI MRI slices while
-# splitting training and validation at subject level. Save model weights and
-# report slice-level epoch metrics, test metrics, and a confusion matrix. Use
-# early stopping with patience 20 and a minimum validation-loss delta of 0.0001."
+# "Train the layer-by-layer convnext model using adjacent ADNI slices as 2.5D
+# input, with a patient-separated validation split, MRI augmentation, MixUp,
+# EMA weights and validation-plateau learning-rate reductions. Save weights,
+# plot epoch metrics, and report balanced and high-recall test operating points."
 
-"""Train and evaluate the slice-level ConvNeXt-Tiny classifier."""
+"""Train, validate, test and save the 2.5D ConvNeXt-Tiny classifier."""
 
 from __future__ import annotations
 
@@ -20,19 +20,24 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from dataset import ADNISliceDataset, create_adni_slice_dataloaders, set_seed
+from dataset import (
+    ADNISliceDataset,
+    FULL_FOREGROUND_CROP_SIZE,
+    MRITrainAugmentation,
+    create_adni_slice_dataloaders,
+    resize_tensor_image,
+    set_seed,
+)
 from modules import ConvNeXt, convnext_tiny
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = SCRIPT_DIR / "ADNI" / "AD_NC"
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_slice_level"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_64px_2_5d_plateau"
 
-DEFAULT_IMAGE_SIZE = 224
-FULL_FOREGROUND_CROP_SIZE = (224, 224)
+DEFAULT_IMAGE_SIZE = 64
 EARLY_STOPPING_PATIENCE = 20
 EARLY_STOPPING_MIN_DELTA = 0.0001
 DEFAULT_EARLY_STOPPING_START_EPOCH = 10
@@ -42,7 +47,6 @@ PLATEAU_PATIENCE = 5
 PLATEAU_FACTOR = 0.5
 PLATEAU_MIN_LR = 1e-6
 COSINE_MIN_LR = 1e-6
-FOREGROUND_THRESHOLD = 10 / 255
 
 
 @dataclass(frozen=True)
@@ -62,17 +66,17 @@ class TestResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ConvNeXt-Tiny on individual ADNI MRI slices."
+        description="Train the 2.5D ConvNeXt-Tiny AD versus NC classifier."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument(
         "--input-mode",
         choices=("crop", "resize"),
-        default="crop",
+        default="resize",
         help=(
             "Either take a foreground-centred crop at --image-size, or take "
             "the complete 224-pixel foreground crop and resize it."
@@ -82,42 +86,46 @@ def parse_args() -> argparse.Namespace:
         "--slice-context",
         type=int,
         choices=(1, 3),
-        default=1,
+        default=3,
         help=(
             "Use one slice replicated over RGB channels, or use the previous, "
             "centre and next slices as a 2.5D three-channel input."
         ),
     )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--stochastic-depth", type=float, default=0.0)
-    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--stochastic-depth", type=float, default=0.1)
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument(
         "--mixup-alpha",
         type=float,
-        default=0.0,
+        default=0.4,
         help="Beta-distribution alpha for batch MixUp; zero disables MixUp.",
     )
     parser.add_argument(
         "--ema-decay",
         type=float,
-        default=0.0,
+        default=0.9999,
         help="Model-weight EMA decay; zero disables EMA.",
     )
     parser.add_argument(
         "--amp-dtype",
         choices=("float16", "bfloat16", "float32"),
-        default="float16",
+        default="bfloat16",
         help="CUDA compute precision; float32 disables autocasting.",
     )
-    parser.add_argument("--augment-training", action="store_true")
-    parser.add_argument("--rotation-degrees", type=float, default=5.0)
+    parser.add_argument(
+        "--augment-training",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--rotation-degrees", type=float, default=7.0)
     parser.add_argument("--translation-fraction", type=float, default=0.05)
     parser.add_argument("--scale-jitter", type=float, default=0.05)
     parser.add_argument("--intensity-jitter", type=float, default=0.10)
     parser.add_argument("--noise-standard-deviation", type=float, default=0.01)
     parser.add_argument("--horizontal-flip-probability", type=float, default=0.0)
-    parser.add_argument("--gamma-jitter", type=float, default=0.0)
+    parser.add_argument("--gamma-jitter", type=float, default=0.2)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
     parser.add_argument(
         "--learning-rate-scheduler",
@@ -150,28 +158,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-level",
         choices=("scan", "patient"),
-        default="scan",
+        default="patient",
     )
     parser.add_argument("--metadata-path", type=Path, default=None)
     parser.add_argument(
         "--normalization",
         choices=("training", "per-slice"),
-        default="training",
+        default="per-slice",
     )
-    parser.add_argument("--balance-patients", action="store_true")
+    parser.add_argument(
+        "--balance-patients",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--exclude-scan",
         action="append",
-        default=[],
+        default=["1012896"],
         help="Scan ID to omit before splitting; may be supplied more than once.",
     )
-    parser.add_argument("--calibrate-threshold", action="store_true")
+    parser.add_argument(
+        "--calibrate-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--target-recall",
+        type=float,
+        default=0.95,
+        help=(
+            "Also report a sensitivity-oriented operating point whose "
+            "threshold is selected to reach at least this AD recall on "
+            "validation data."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--training-seed",
         type=int,
-        default=None,
+        default=123,
         help="Seed for model initialization, batch order and slice sampling.",
     )
     parser.add_argument(
@@ -220,6 +246,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--horizontal-flip-probability must be in [0, 1]")
     if not 0.0 <= args.gamma_jitter < 1.0:
         parser.error("--gamma-jitter must be in [0, 1)")
+    if args.target_recall is not None and not 0.0 < args.target_recall <= 1.0:
+        parser.error("--target-recall must be in (0, 1]")
     if args.warmup_epochs < 0:
         parser.error("--warmup-epochs cannot be negative")
     if args.gradient_clip <= 0:
@@ -235,124 +263,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slices-per-scan-per-epoch must be positive")
 
     return args
-
-
-def resize_tensor_image(image: torch.Tensor, *, size: int) -> torch.Tensor:
-    """Resize a CHW tensor to a square without taking another crop."""
-
-    if image.shape[-2:] == (size, size):
-        return image
-    return F.interpolate(
-        image.unsqueeze(0),
-        size=(size, size),
-        mode="bilinear",
-        align_corners=False,
-        antialias=True,
-    ).squeeze(0)
-
-
-class MRITrainAugmentation:
-    """Apply mild spatial and intensity variation to one training slice."""
-
-    def __init__(
-        self,
-        *,
-        size: int,
-        rotation_degrees: float,
-        translation_fraction: float,
-        scale_jitter: float,
-        intensity_jitter: float,
-        noise_standard_deviation: float,
-        horizontal_flip_probability: float = 0.0,
-        gamma_jitter: float = 0.0,
-    ) -> None:
-        self.size = size
-        self.rotation_degrees = rotation_degrees
-        self.translation_fraction = translation_fraction
-        self.scale_jitter = scale_jitter
-        self.intensity_jitter = intensity_jitter
-        self.noise_standard_deviation = noise_standard_deviation
-        self.horizontal_flip_probability = horizontal_flip_probability
-        self.gamma_jitter = gamma_jitter
-
-    @staticmethod
-    def _uniform(low: float, high: float) -> float:
-        return torch.empty(()).uniform_(low, high).item()
-
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        image = resize_tensor_image(image, size=self.size)
-        if torch.rand(()).item() < self.horizontal_flip_probability:
-            image = image.flip(-1)
-
-        angle = math.radians(
-            self._uniform(-self.rotation_degrees, self.rotation_degrees)
-        )
-        desired_scale = self._uniform(
-            1.0 - self.scale_jitter,
-            1.0 + self.scale_jitter,
-        )
-        translation_x = 2.0 * self._uniform(
-            -self.translation_fraction,
-            self.translation_fraction,
-        )
-        translation_y = 2.0 * self._uniform(
-            -self.translation_fraction,
-            self.translation_fraction,
-        )
-        cosine = math.cos(angle) / desired_scale
-        sine = math.sin(angle) / desired_scale
-        theta = image.new_tensor(
-            [
-                [cosine, -sine, translation_x],
-                [sine, cosine, translation_y],
-            ]
-        ).unsqueeze(0)
-        grid = F.affine_grid(
-            theta,
-            size=(1, image.shape[0], self.size, self.size),
-            align_corners=False,
-        )
-        image = F.grid_sample(
-            image.unsqueeze(0),
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=False,
-        ).squeeze(0)
-
-        foreground = image.amax(dim=0, keepdim=True) > FOREGROUND_THRESHOLD
-        foreground_values = image.masked_select(foreground.expand_as(image))
-        if foreground_values.numel():
-            if self.gamma_jitter:
-                gamma = self._uniform(
-                    1.0 - self.gamma_jitter,
-                    1.0 + self.gamma_jitter,
-                )
-                image = image.clamp_min(0.0).pow(gamma)
-                foreground_values = image.masked_select(
-                    foreground.expand_as(image)
-                )
-            foreground_mean = foreground_values.mean()
-            contrast = self._uniform(
-                1.0 - self.intensity_jitter,
-                1.0 + self.intensity_jitter,
-            )
-            gain = self._uniform(
-                1.0 - self.intensity_jitter,
-                1.0 + self.intensity_jitter,
-            )
-            image = (image - foreground_mean) * contrast + foreground_mean
-            image = image * gain
-            if self.noise_standard_deviation:
-                noise = torch.randn(
-                    (1, self.size, self.size),
-                    dtype=image.dtype,
-                    device=image.device,
-                ) * self.noise_standard_deviation
-                image = image + noise
-            image = torch.where(foreground, image.clamp(0.0, 1.0), 0.0)
-
-        return image
 
 
 class ModelEMA:
@@ -763,6 +673,50 @@ def select_validation_threshold(
     return best_threshold
 
 
+def select_validation_threshold_for_recall(
+    results: list[TestResult],
+    *,
+    ad_index: int,
+    target_recall: float,
+) -> float:
+    """Select the most specific validation threshold meeting AD recall.
+
+    Probabilities are processed from highest to lowest. The first threshold
+    that includes at least the requested proportion of validation AD slices
+    is therefore the highest threshold satisfying the recall constraint and
+    preserves as much NC specificity as possible.
+    """
+
+    if not 0.0 < target_recall <= 1.0:
+        raise ValueError("target_recall must be in (0, 1]")
+    positive_count = sum(result.target == ad_index for result in results)
+    if not positive_count:
+        raise ValueError("Recall threshold selection requires AD samples")
+
+    ordered = sorted(
+        results,
+        key=lambda result: result.ad_probability,
+        reverse=True,
+    )
+    true_positives = 0
+    index = 0
+    while index < len(ordered):
+        threshold = ordered[index].ad_probability
+        end = index
+        while (
+            end < len(ordered)
+            and ordered[end].ad_probability == threshold
+        ):
+            if ordered[end].target == ad_index:
+                true_positives += 1
+            end += 1
+        if true_positives / positive_count >= target_recall:
+            return threshold
+        index = end
+
+    raise RuntimeError("Could not select a validation recall threshold")
+
+
 def report_validation_results(
     validation_loss: float,
     results: list[TestResult],
@@ -770,6 +724,7 @@ def report_validation_results(
     ad_index: int,
     nc_index: int,
     decision_threshold: float,
+    operating_point_name: str = "balanced-accuracy operating point",
 ) -> dict[str, Any]:
     results = apply_decision_threshold(
         results,
@@ -784,7 +739,10 @@ def report_validation_results(
         nc_index=nc_index,
         decision_threshold=decision_threshold,
     )
-    print("\nSlice-level validation results (AD is the positive class)")
+    print(
+        f"\nSlice-level validation results - {operating_point_name} "
+        "(AD is the positive class)"
+    )
     print(f"Decision threshold: {decision_threshold:.4f}")
     print(f"Accuracy:           {metrics['accuracy']:.2%}")
     print(f"Balanced accuracy:  {metrics['balanced_accuracy']:.2%}")
@@ -825,6 +783,8 @@ def report_test_results(
     idx_to_class: dict[int, str],
     output_dir: Path,
     decision_threshold: float = 0.5,
+    operating_point_name: str = "balanced-accuracy operating point",
+    confusion_matrix_filename: str = "test_confusion_matrix.png",
 ) -> dict[str, Any]:
     """Print test metrics and optionally save a confusion-matrix figure."""
 
@@ -863,7 +823,10 @@ def report_test_results(
     recall = metrics["recall"]
     f1 = metrics["f1"]
 
-    print("\nSlice-level test results (AD is the positive class)")
+    print(
+        f"\nSlice-level test results - {operating_point_name} "
+        "(AD is the positive class)"
+    )
     print(f"Decision threshold: {decision_threshold:.4f}")
     print(f"Loss:      {test_loss:.4f}")
     print(f"Accuracy:  {accuracy:.2%} ({len(correct)}/{len(results)})")
@@ -873,7 +836,7 @@ def report_test_results(
     print(f"F1 score:  {f1:.2%}")
     print(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
 
-    print("\nSlice-level test confusion matrix")
+    print(f"\nSlice-level test confusion matrix - {operating_point_name}")
     print("                    Predicted NC  Predicted AD")
     print(f"Actual NC (negative) {true_negatives:12d} {false_positives:13d}")
     print(f"Actual AD (positive) {false_negatives:12d} {true_positives:13d}")
@@ -920,7 +883,7 @@ def report_test_results(
     heatmap = axis.imshow(confusion_matrix, cmap="Blues")
     axis.set_xticks([0, 1], labels=["Predicted NC", "Predicted AD"])
     axis.set_yticks([0, 1], labels=["Actual NC", "Actual AD"])
-    axis.set_title("AD vs NC Slice-Level Test Confusion Matrix")
+    axis.set_title(f"AD vs NC Test Confusion Matrix\n{operating_point_name}")
 
     threshold = max(max(row) for row in confusion_matrix) / 2
     for row in range(2):
@@ -950,12 +913,203 @@ def report_test_results(
         fontsize=11,
     )
     figure.tight_layout(rect=(0, 0.05, 1, 1))
-    confusion_matrix_path = output_dir / "test_confusion_matrix.png"
+    confusion_matrix_path = output_dir / confusion_matrix_filename
     figure.savefig(confusion_matrix_path, dpi=160)
     plt.close(figure)
     print(f"Confusion matrix saved to: {confusion_matrix_path}")
 
     return metrics
+
+
+def report_target_recall_operating_point(
+    *,
+    target_recall: float,
+    validation_loss: float,
+    validation_results: list[TestResult],
+    test_loss: float,
+    test_results: list[TestResult],
+    ad_index: int,
+    nc_index: int,
+    idx_to_class: dict[int, str],
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Report a validation-selected high-sensitivity operating point."""
+
+    decision_threshold = select_validation_threshold_for_recall(
+        validation_results,
+        ad_index=ad_index,
+        target_recall=target_recall,
+    )
+    operating_point_name = (
+        f"{target_recall:.0%} validation-recall operating point"
+    )
+    validation_metrics = report_validation_results(
+        validation_loss,
+        validation_results,
+        ad_index=ad_index,
+        nc_index=nc_index,
+        decision_threshold=decision_threshold,
+        operating_point_name=operating_point_name,
+    )
+    test_metrics = report_test_results(
+        test_loss,
+        test_results,
+        ad_index=ad_index,
+        nc_index=nc_index,
+        idx_to_class=idx_to_class,
+        output_dir=output_dir,
+        decision_threshold=decision_threshold,
+        operating_point_name=operating_point_name,
+        confusion_matrix_filename=(
+            f"test_confusion_matrix_{round(target_recall * 100)}_recall.png"
+        ),
+    )
+    return {
+        "target_validation_recall": target_recall,
+        "decision_threshold": decision_threshold,
+        "validation": validation_metrics,
+        "test": test_metrics,
+    }
+
+
+def save_training_curves(
+    history: list[dict[str, Any]],
+    output_dir: Path,
+) -> Path:
+    """Save train/validation loss and accuracy as a dependency-free SVG."""
+
+    if not history:
+        raise ValueError("Cannot plot an empty training history")
+
+    width = 1000
+    height = 480
+    panel_width = 400
+    panel_height = 320
+    panel_top = 75
+    panel_lefts = (70, 570)
+    train_colour = "#d95f02"
+    validation_colour = "#1b75bc"
+    epochs = [int(record["epoch"]) for record in history]
+
+    def x_position(index: int, left: int) -> float:
+        if len(history) == 1:
+            return left + panel_width / 2
+        return left + panel_width * index / (len(history) - 1)
+
+    def series_points(
+        values: list[float],
+        *,
+        left: int,
+        minimum: float,
+        maximum: float,
+    ) -> str:
+        value_range = maximum - minimum
+        return " ".join(
+            f"{x_position(index, left):.1f},"
+            f"{panel_top + panel_height * (maximum - value) / value_range:.1f}"
+            for index, value in enumerate(values)
+        )
+
+    def panel(
+        *,
+        left: int,
+        title: str,
+        train_values: list[float],
+        validation_values: list[float],
+        fixed_bounds: tuple[float, float] | None = None,
+    ) -> list[str]:
+        if fixed_bounds is None:
+            minimum = min(*train_values, *validation_values)
+            maximum = max(*train_values, *validation_values)
+            padding = max((maximum - minimum) * 0.08, 1e-4)
+            minimum -= padding
+            maximum += padding
+        else:
+            minimum, maximum = fixed_bounds
+
+        elements = [
+            f'<text x="{left + panel_width / 2:.1f}" y="48" '
+            f'text-anchor="middle" font-size="22">{title}</text>',
+            f'<rect x="{left}" y="{panel_top}" width="{panel_width}" '
+            f'height="{panel_height}" fill="white" stroke="#333"/>',
+        ]
+        for grid_index in range(5):
+            fraction = grid_index / 4
+            y = panel_top + panel_height * fraction
+            value = maximum - (maximum - minimum) * fraction
+            elements.extend(
+                [
+                    f'<line x1="{left}" y1="{y:.1f}" '
+                    f'x2="{left + panel_width}" y2="{y:.1f}" '
+                    'stroke="#dddddd"/>',
+                    f'<text x="{left - 10}" y="{y + 5:.1f}" '
+                    f'text-anchor="end" font-size="13">{value:.3f}</text>',
+                ]
+            )
+        elements.extend(
+            [
+                f'<polyline points="{series_points(train_values, left=left, minimum=minimum, maximum=maximum)}" '
+                f'fill="none" stroke="{train_colour}" stroke-width="2.5"/>',
+                f'<polyline points="{series_points(validation_values, left=left, minimum=minimum, maximum=maximum)}" '
+                f'fill="none" stroke="{validation_colour}" stroke-width="2.5"/>',
+                f'<text x="{left}" y="{panel_top + panel_height + 28}" '
+                f'font-size="13">Epoch {epochs[0]}</text>',
+                f'<text x="{left + panel_width}" '
+                f'y="{panel_top + panel_height + 28}" text-anchor="end" '
+                f'font-size="13">Epoch {epochs[-1]}</text>',
+            ]
+        )
+        return elements
+
+    train_losses = [float(record["train"]["loss"]) for record in history]
+    validation_losses = [
+        float(record["validation"]["loss"]) for record in history
+    ]
+    train_accuracies = [
+        float(record["train"]["accuracy"]) for record in history
+    ]
+    validation_accuracies = [
+        float(record["validation"]["accuracy"]) for record in history
+    ]
+
+    svg_elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#fafafa"/>',
+        '<text x="500" y="25" text-anchor="middle" font-size="24" '
+        'font-weight="bold">ConvNeXt Training History</text>',
+    ]
+    svg_elements.extend(
+        panel(
+            left=panel_lefts[0],
+            title="Cross-entropy loss",
+            train_values=train_losses,
+            validation_values=validation_losses,
+        )
+    )
+    svg_elements.extend(
+        panel(
+            left=panel_lefts[1],
+            title="Accuracy",
+            train_values=train_accuracies,
+            validation_values=validation_accuracies,
+            fixed_bounds=(0.0, 1.0),
+        )
+    )
+    svg_elements.extend(
+        [
+            f'<line x1="375" y1="445" x2="410" y2="445" '
+            f'stroke="{train_colour}" stroke-width="3"/>',
+            '<text x="418" y="450" font-size="14">Training</text>',
+            f'<line x1="520" y1="445" x2="555" y2="445" '
+            f'stroke="{validation_colour}" stroke-width="3"/>',
+            '<text x="563" y="450" font-size="14">Validation</text>',
+            "</svg>",
+        ]
+    )
+    output_path = output_dir / "training_curves.svg"
+    output_path.write_text("\n".join(svg_elements), encoding="utf-8")
+    return output_path
 
 
 def main() -> None:
@@ -1139,6 +1293,11 @@ def main() -> None:
             else "fixed at 0.5"
         )
     )
+    if args.target_recall is not None:
+        print(
+            f"Secondary AD operating point: at least "
+            f"{args.target_recall:.0%} recall on validation data"
+        )
 
     if args.evaluate_only:
         print(f"Evaluation only; loading weights from: {test_weights_path}")
@@ -1159,12 +1318,18 @@ def main() -> None:
                 validation_results,
                 ad_index=ad_index,
             )
+        primary_operating_point_name = (
+            "balanced-accuracy operating point"
+            if args.calibrate_threshold
+            else "fixed 0.5 operating point"
+        )
         validation_report = report_validation_results(
             validation_loss,
             validation_results,
             ad_index=ad_index,
             nc_index=nc_index,
             decision_threshold=decision_threshold,
+            operating_point_name=primary_operating_point_name,
         )
         test_loss, test_results = infer_test_set(
             model,
@@ -1182,7 +1347,21 @@ def main() -> None:
             idx_to_class=idx_to_class,
             output_dir=args.output_dir,
             decision_threshold=decision_threshold,
+            operating_point_name=primary_operating_point_name,
         )
+        target_recall_report = None
+        if args.target_recall is not None:
+            target_recall_report = report_target_recall_operating_point(
+                target_recall=args.target_recall,
+                validation_loss=validation_loss,
+                validation_results=validation_results,
+                test_loss=test_loss,
+                test_results=test_results,
+                ad_index=ad_index,
+                nc_index=nc_index,
+                idx_to_class=idx_to_class,
+                output_dir=args.output_dir,
+            )
         test_metrics_path = args.output_dir / "test_metrics.json"
         with test_metrics_path.open("w", encoding="utf-8") as metrics_file:
             json.dump(
@@ -1204,6 +1383,7 @@ def main() -> None:
                     "excluded_scans": args.exclude_scan,
                     "calibrate_threshold": args.calibrate_threshold,
                     "decision_threshold": decision_threshold,
+                    "target_recall": args.target_recall,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -1213,6 +1393,7 @@ def main() -> None:
                     "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
                     "validation": validation_report,
                     "test": test_metrics,
+                    "target_recall_operating_point": target_recall_report,
                 },
                 metrics_file,
                 indent=2,
@@ -1332,6 +1513,8 @@ def main() -> None:
                 "validation": asdict(validation_metrics),
             }
         )
+        # Refresh the plot every epoch so partial jobs still retain curves.
+        training_curves_path = save_training_curves(history, args.output_dir)
 
         print(
             f"Epoch {epoch:03d}/{args.epochs} | "
@@ -1418,6 +1601,7 @@ def main() -> None:
             )
             break
 
+    print(f"Training curves saved to: {training_curves_path}")
     torch.save(model.state_dict(), last_weights_path)
     if model_ema is not None:
         torch.save(model_ema.module.state_dict(), last_ema_weights_path)
@@ -1451,12 +1635,18 @@ def main() -> None:
             validation_results,
             ad_index=ad_index,
         )
+    primary_operating_point_name = (
+        "balanced-accuracy operating point"
+        if args.calibrate_threshold
+        else "fixed 0.5 operating point"
+    )
     validation_report = report_validation_results(
         validation_loss,
         validation_results,
         ad_index=ad_index,
         nc_index=nc_index,
         decision_threshold=decision_threshold,
+        operating_point_name=primary_operating_point_name,
     )
     test_loss, test_results = infer_test_set(
         model,
@@ -1474,7 +1664,21 @@ def main() -> None:
         idx_to_class=idx_to_class,
         output_dir=args.output_dir,
         decision_threshold=decision_threshold,
+        operating_point_name=primary_operating_point_name,
     )
+    target_recall_report = None
+    if args.target_recall is not None:
+        target_recall_report = report_target_recall_operating_point(
+            target_recall=args.target_recall,
+            validation_loss=validation_loss,
+            validation_results=validation_results,
+            test_loss=test_loss,
+            test_results=test_results,
+            ad_index=ad_index,
+            nc_index=nc_index,
+            idx_to_class=idx_to_class,
+            output_dir=args.output_dir,
+        )
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         json.dump(
@@ -1491,6 +1695,7 @@ def main() -> None:
                     "excluded_scans": args.exclude_scan,
                     "calibrate_threshold": args.calibrate_threshold,
                     "decision_threshold": decision_threshold,
+                    "target_recall": args.target_recall,
                     "foreground_mean": training_dataset.foreground_mean,
                     "foreground_standard_deviation": (
                         training_dataset.foreground_standard_deviation
@@ -1539,6 +1744,7 @@ def main() -> None:
                 "history": history,
                 "validation": validation_report,
                 "test": test_metrics,
+                "target_recall_operating_point": target_recall_report,
             },
             metrics_file,
             indent=2,

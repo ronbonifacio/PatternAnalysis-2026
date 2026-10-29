@@ -9,7 +9,7 @@ from train import main
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_64px_2_5d"
+OUTPUT_DIR = SCRIPT_DIR / "output" / "convnext_tiny_64px_2_5d_plateau"
 
 
 if __name__ == "__main__":
@@ -61,12 +61,14 @@ if __name__ == "__main__":
         "--gamma-jitter",
         "0.2",
         "--learning-rate-scheduler",
-        "cosine",
+        "plateau",
         "--early-stopping-start-epoch",
         "10",
         "--test-checkpoint",
         "loss",
         "--calibrate-threshold",
+        "--target-recall",
+        "0.95",
         "--training-seed",
         "123",
         "--output-dir",
