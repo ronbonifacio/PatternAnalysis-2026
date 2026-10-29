@@ -7,11 +7,11 @@ The implementation foreground-centres and resizes each MRI slice, applies foregr
 
 The following figure shows the inference pipeline for a single MRI slice.
 
-![Inference pipeline for a single MRI slice](./figures/inference_pipeline.jpg)
+<img src="./figures/inference_pipeline.jpg" alt="Inference pipeline for a single MRI slice" width="70%">
 
 The following figure shows the training pipeline for a single MRI slice.
 
-![Training pipeline for a single MRI slice](./figures/training_pipeline_figure.jpg)
+<img src="./figures/training_pipeline_figure.jpg" alt="Training pipeline for a single MRI slice" width="70%">
 
 (Training pipeline figure generated with GPT-5.6 Sol)
 
@@ -28,15 +28,15 @@ The following is the written feasibility report completed at the midpoint of the
 
 It is important to note that the basic shallow CNN smoketest completed within this feasibility report utilised a different input and output architecture compared with the final model. This was that it was a scan-level classifier that made predictions based on the average of 12 slices from a scan, rather than a slice-level classifier that makes predictions based on a single slice and its adjacent slices like the final model. The change to the slice-level classifier was made afterwards, with the driving reason being that at the beginning of the project, the model had trouble learning the training data and was underfitting. I thought a reason for this was that the model did not have enough training samples to learn from and thus the scan-level sample size of 1076 was increased to a slice-level sample size of 21,520.
 
-## Feasibility Report: Preparing a ConvNeXt Model for Neuroimaging, AD vs NC Classification
+### Feasibility Report: Preparing a ConvNeXt Model for Neuroimaging, AD vs NC Classification
 
-### 1. User Need Scope & Acceptance Criteria
+#### 1. User Need Scope & Acceptance Criteria
 
 - **User Scope:** The intended users are medical researchers or healthcare professional who may use the model to assist them in diagnosing patients from the MRI scans.
 - The prototype model will be used to determine if a ConvNext model is useful for the classification context, and if the heavier model provides value over a basic CNN classifier.
 - **Acceptance Criteria:** Aim for 80% minimum test accuracy. Aim for High Recall at least 95%. Model can be trained within the hardware constraints set by the Rangpur HPC, peak VRAM < 40GB.
 
-### 2. Model Choice & Core Concepts
+#### 2. Model Choice & Core Concepts
 
 - Dataset configuration will be used with the originally provided train/test split. Training set will be divided into an 80/20 training/validation set using the validation performance to tune hyperparameters of the model. Final inference will then be run on the test set to determine the true performance of the model.
 - ConvNeXt (Difficulty Band Hard) model architecture will be used. Driving reason for this being that they are known to match or outperform conventional CNNs. They use large depth wise kernels, wide hidden layers, and less activation functions to mimic the behaviour of a transformer.
@@ -44,13 +44,13 @@ It is important to note that the basic shallow CNN smoketest completed within th
 - It is recommended that the model would be used in conjunction with professional opinion as this is a safety critical application. As a result:
   - We **aim for high recall** as a misclassified AD would be detrimental to the patient.
 
-### 3. Preliminary Feasibility Evidence
+#### 3. Preliminary Feasibility Evidence
 
 - Dataset is provided as a separated training and test set with clear distinctions of patient numbers and MRI images in the format of &lt;patient_number&gt;\_&lt;image_number&gt;.
   - This can be used to ensure patient-level separation of the data.
 - A smoke test with a shallow CNN was created to judge the effectiveness of a basic CNN model. The result was trained on my laptop on CPU, achieving a validation accuracy of 80% after 46 epochs completing training within the hour. Results are in the appendix.
 
-### 4. Risk Budget and Fallback
+#### 4. Risk Budget and Fallback
 
 Risks include:
 
@@ -59,7 +59,7 @@ Risks include:
 - Training Risk: Training of the heavier ConvNeXt model may take a long time so it is important that adequate time is provided to train the model on the Rangpur HPC. Adequate time must be allocated for model training, inference, performance evaluation and interpretation of results within the project deadline.
   - If training is incomplete/the model resulted in poor performance, the fallback is to still perform the evaluation and comparison to the basic CNN on the model that we ended up with.
 
-### Appendix, Smoke Test Results:
+#### Appendix, Smoke Test Results:
 
 ![Smoke Test Confusion Matrix](./figures/smoke_test_confusion_matrix.png)
 
@@ -101,35 +101,6 @@ python predict.py \
 
 To re-score the metrics of an existing checkpoint without training, add `--evaluate-only` to `train.py`.
 
-## Example inputs and outputs
-
-Running `predict.py` saves a labelled grid of test examples to `output/convnext_tiny_64px_2_5d_plateau/prediction_examples.png`.
-A copy is reproduced below.
-
-![Example test predictions with AD probabilities](./figures/prediction_examples.png)
-
-Each panel shows the centre slice of one 2.5D input as the model sees it, after the foreground crop, the resize to 64x64 and per-channel foreground normalisation.
-The previous and next slices occupy the other two channels and are not displayed.
-The caption gives the slice identifier, the true diagnosis, the predicted AD probability, and the decision taken at each of the two validation-selected operating points.
-
-An example of the matching console output is:
-
-```
-1003730_88: actual=AD, P(AD)=0.204, balanced=NC, 95% validation recall=AD
-1003730_89: actual=AD, P(AD)=0.213, balanced=NC, 95% validation recall=AD
-1003730_90: actual=AD, P(AD)=0.519, balanced=NC, 95% validation recall=AD
-1003730_91: actual=AD, P(AD)=0.456, balanced=NC, 95% validation recall=AD
-```
-
-These eight examples are the first eight slices the test loader returns rather than a random sample, so they all belong to scan `1003730` and show consecutive slices 88 to 95 of the same brain.
-They are informative for exactly that reason.
-Every slice is truly AD, every predicted probability sits between 0.20 and 0.52, and the two operating points therefore disagree on all eight: the balanced-accuracy threshold calls them NC and the high-recall threshold calls them AD.
-At the balanced operating point these are eight consecutive false negatives from one scan.
-
-Two properties of the model are visible here.
-Predictions are made independently per slice, yet the probabilities move smoothly across neighbouring slices (0.204, 0.213, 0.519, 0.456, 0.247, 0.237, 0.323, 0.325), which is the expected consequence of adjacent slices sharing most of their anatomy through the 2.5D input.
-The probabilities also sit well below 0.5 for a genuinely AD scan, which is the behaviour the secondary high-sensitivity operating point exists to address: lowering the threshold recovers all eight at the cost of specificity elsewhere.
-
 ## Reproducibility
 
 Two seeds control the run, and both are recorded in `metrics.json` alongside the full configuration.
@@ -141,174 +112,260 @@ Two seeds control the run, and both are recorded in `metrics.json` alongside the
 
 Scan `1012896` is excluded before splitting because its slices contain no usable foreground.
 
-## Superseded subject-level experiment
+## Example inputs and outputs
 
-The first model averaged features from 12 slices to make one prediction per
-subject. It stopped at epoch 24 with a best validation accuracy of 59.07%, well
-below the 80% target, so this design was superseded. Its dataset, model and
-training code remain under `superseded/`.
+Running `predict.py` samples eight random test slices and saves a labelled grid to `output/convnext_tiny_64px_2_5d_plateau/prediction_examples.png`.
+An example is shown below.
 
-## Scan-safe slice classification
+![Example test predictions with AD probabilities](./figures/prediction_examples.png)
 
-The active data loader groups filenames by patient before making the 80/20
-training and validation split, ensuring repeated scans and neighbouring slices
-cannot cross the split. Each input contains the previous, centre and next MRI
-slices as three channels. ConvNeXt returns one prediction for the centre slice,
-with no cross-slice averaging. Test metrics are calculated over all 9,000 test
-slices.
+Each panel shows the centre slice of one 2.5D input, after the foreground crop, the resize to 64x64 and per-channel foreground normalisation.
+The previous and next slices occupy the other two channels and are not displayed.
+Each caption gives the slice identifier, the true diagnosis, the predicted AD probability, and the decision taken at each of the two validation-selected operating points.
 
-The ConvNeXt-Tiny stages use depths `(3, 3, 9, 3)` and channels
-`(96, 192, 384, 768)`. Its original 1000-class parameter count matches
-TorchVision at 28,589,128 parameters.
+The eight slices are drawn with `torch.randperm` across all 9,000 test slices under `--example-seed`, so they come from eight different scans. Re-running the script reproduces the same selection.
+This sample contains three AD slices and five NC slices, and seven of the eight are classified correctly at the validation set balanced-accuracy threshold of 0.6484.
 
-## Training setup
+## Data pre-processing and split justification
 
-AdamW uses batch size 8, a base learning rate of `0.0001` and weight decay of
-`0.05`.
-Training linearly warms up for five epochs. After warm-up, the learning rate is
-halved by a validation-plateau scheduler with patience 5, down to a minimum of
-`0.000001`. Training uses stochastic depth `0.1`, label smoothing `0.1`, MixUp
-`0.4`, EMA weights and gradient clipping at `1.0`.
+### Batch size
 
-## Early stopping
+The model was originally trained with 224x224 inputs and a batch size of 48, but training accuracy plateaued at 66.14%, underfitting the training data.
+A trial run with an input size of 64x64 and a batch size of 8 confirmed the model itself was not at fault, as it memorised eight real slices to 100% accuracy within a few updates. The input was then reduced to these parameters, and the full training run reached 100% training accuracy.
+The most likely cause is the number of optimizer updates per epoch. A batch size of 48 gives about 359 updates, while batch 8 gives 2,118, so at the same learning rate the smaller batch makes roughly six times more progress per epoch.
+Because the input size and batch size were changed together, their individual effects were not isolated.
 
-Training saves the model when validation loss improves by at least `0.0001` and
-stops after 20 consecutive epochs without that improvement. Counting begins
-after epoch 10 so the warm-up and initial learning period cannot stop training
-prematurely. Final test inference uses the best saved weights.
+### Pre-processing pipeline
 
-## Hyperparameter changes
+Every example is a previous/centre/next slice input taken from one scan, and the pipeline below runs per example inside the data loader.
 
-- Increased the learning rate from `0.00005` to `0.0001` after the lower rate
-  produced stable training but plateaued.
-- Replaced the constant post-warm-up rate with validation-plateau reductions.
-- Increased early-stopping patience from 5 to 20 epochs.
-- Reduced the minimum validation-loss improvement from `0.001` to `0.0001`.
+1. **Triplet construction.** The three channels hold the previous, centre and next slices of the same scan, with the label and prediction belonging to the centre slice. The first and last slices repeat their image to their neighbouring channel. Using adjacent slices as channels follows the pre-processing completed in an MRI classification study by Soelistiono S. ([adjacent-slice 2.5D MRI classification](https://pmc.ncbi.nlm.nih.gov/articles/PMC13085064/)).
+2. **Foreground-centred crop.** Each 256x240 slice receives a constant 224x224 (the original ConvNeXt-Tiny input size) crop centred on the bounding box of its foreground. The crop size is fixed so differences in anatomical scale between patients are preserved.
+3. **Resize to 64x64.** The crop is resized bilinearly to 64x64. This was done after the aforementioned smaller input and batch size trial run. A run with 96x96 inputs was later completed, but it generalised worse than 64x64. A reasoning behind this is that larger input images contain fine scanner-specific texture that is not relevant to the diagnosis, and the smaller input removes that texture, and widens the model's receptive field relative to the brain.  
+4. **Training augmentation.** Training examples receive a random affine warp (rotation +/-7 degrees, translation +/-5%, scale +/-5%) followed by gamma jitter (+/-20%), contrast and gain jitter (+/-10% each) and additive Gaussian noise with standard deviation 0.01. These transforms are shared across the three channels so that the 2.5D context remains consistent. There is deliberately **no flipping**, since all the scans within the dataset share orientation.
+5. **Foreground-only normalisation.** Each channel is standardised independently using the mean and standard deviation of its own foreground pixels, and background pixels are forced to exactly zero. This removes intensity variation that MRI acquisition introduces between slices.
+6. **MixUp.** Batches are mixed on the GPU after normalisation using a mixing weight drawn from a Beta(0.4, 0.4) distribution, with one weight shared by the whole batch, and the loss is the matching weighted combination of the two label assignments ([MixUp](https://openreview.net/pdf?id=r1Ddp1-Rb)).
 
-## MRI preprocessing
+Validation and test pre-processing consists of steps 1, 2, 3 and 5 only.
 
-Each original 256×240 slice receives a constant 224×224 crop centred on its
-non-black foreground, which is resized to 64×64. Each of the three adjacent
-slices is normalized using its own foreground mean and standard deviation,
-while black background pixels remain zero. Training adds mild rotation,
-translation, scaling, gamma, intensity and noise augmentation using one shared
-spatial transform across all three channels.
+### Regularisation and training-time techniques
 
-## Cosine scheduler experiment
+Most of these settings are taken from Table 5 in Appendix A.1 of [A ConvNet for the 2020s](https://arxiv.org/abs/2201.03545), which lists the ImageNet-1K training recipe, and several are used at exactly the published value.
+The rest are changed or dropped because this project trains from scratch on 21,500 MRI slices rather than 1.28 million natural images.
+The source column below says where each value came from .
 
-`superseded/train_cosine.py` preserves a comparison run using the same model and
-preprocessing. It warms up to `0.0001`, follows cosine annealing down to
-`0.000001`, and completes all 100 epochs without early stopping. Its weights
-and metrics use a separate `output/convnext_tiny_slice_level_cosine` folder.
+| Technique | Setting | Source | Purpose |
+| --- | --- | --- | --- |
+| Stochastic depth | 0.1, scaled linearly with block depth | Paper Table 5, 0.1 for ConvNeXt-T | Drops whole residual branches, strongest in the deepest blocks |
+| Label smoothing | 0.1 | Paper Table 5, unchanged | Prevents over-confident logits on noisy slice-level labels |
+| Weight decay | 0.05 (AdamW) | Paper Table 5, unchanged | Constrains weight magnitude on a small dataset |
+| Layer scale | 1e-6 initial | Paper Table 5, unchanged | Keeps residual branches near-identity early in training |
+| EMA | decay 0.9999 | Paper Table 5, unchanged | Averaged weights used for validation, checkpoint selection and all final inference |
+| Weight init | truncated normal, std 0.02 | TorchVision ConvNeXt source | Matches the reference implementation |
+| MixUp | alpha 0.4 | Reduced from the paper's 0.8 | Discourages memorisation of correlated slices |
+| Dropout | none | Paper Table 5 uses none | Stochastic depth and MixUp regularise instead |
+| RandAugment, CutMix, random erasing | not used | Dropped from the paper recipe | All three are designed for natural images and would destroy or mislabel anatomy |
+| Gradient clipping | global norm 1.0 | Added, the paper lists "None" | Caps rare large updates at batch size 8 |
+| Mixed precision | bfloat16 autocast | | fix for the non-finite losses that float16 produced |
 
-Test metrics and the confusion matrix are printed and saved as JSON even when
-Matplotlib is unavailable; only the optional PNG is skipped.
+### Learning rate schedule, warm-up and early stopping
 
-## Training diagnosis
+The learning rate uses a linear warm-up followed by reduction on validation loss plateaus, and training is terminated by early stopping.
 
-The cosine run plateaued at 66.14% training accuracy and approximately 61%
-validation accuracy. A separate memorization check reached 100% accuracy on
-eight real slices within a few updates at both `0.0001` and `0.001`, confirming
-that the model, gradients and optimizer work correctly. The full-data plateau
-is therefore more likely caused by weak slice-level supervision: all slices
-inherit the scan diagnosis even though an individual slice may contain limited
-diagnostic information, and the 21,520 correlated slices represent only 1,076
-scans. Further fixed-epoch cosine training is unlikely to resolve this plateau.
+**Warm-up.** The first five epochs ramp the learning rate linearly from `2e-5` to the base rate of `1e-4` in equal steps.
+A randomly initialised network produces large,  gradients in its first few hundred updates. Applying the larger base learning rate immediately risks divergence.
+The ConvNeXt recipe uses 20 warm-up epochs for a 300-epoch ImageNet schedule, and five was chosen here as a proportion of a much shorter run.
 
-## Slice-subsampling pilot
+**Plateau reductions.** After warm-up the rate is controlled by `ReduceLROnPlateau` watching validation loss, with factor `0.5`, patience `5`, an absolute improvement threshold of `1e-4` and a floor of `1e-6`.
+The rate is halved when validation loss has failed to improve for five consecutive epochs.
 
-`superseded/train_subsampled.py` keeps the original scan split (`seed=42`) but uses
-training seed `123`. Each epoch randomly selects four distinct slices from
-every training scan and reshuffles them, while validation and test inference
-still use every slice. This reduces each training epoch from 17,220 correlated
-slices to 3,444 and stores results separately under
-`output/convnext_tiny_slice_subsampling`. It otherwise uses the same 100-epoch
-cosine setup.
+In the final run this produced the following trajectory.
 
-## Small-input pilot
+| Epoch | Learning rate | Event |
+| ---: | ---: | --- |
+| 1 to 5 | 2e-5 rising to 1e-4 | Linear warm-up |
+| 27 | 1e-4 | Best validation loss, 0.4690, checkpoint saved |
+| 34 | 5e-5 | First plateau reduction |
+| 40 | 2.5e-5 | Second plateau reduction |
+| 46 | 1.25e-5 | Third plateau reduction |
+| 47 | 1.25e-5 | Early stopping, 20 epochs since the best |
 
-`superseded/train_small_input.py` trains on all 17,220 slices with batch size 8. A check
-on eight images found that both a central 64×64 crop and the complete brain
-resized to 64×64 reached 100% training accuracy; the resized version learned
-faster, so the pilot uses it. Full validation loss and accuracy are reported
-after every epoch.
+**Early stopping.** Training stops once validation loss has gone 20 consecutive epochs without improving by at least `1e-4`, and counting does not begin until after epoch 10 so that the warm-up and initial learning phase cannot end the run prematurely.
+The maximum budget is 100 epochs, and the final run used 47 of them.
 
-The original 224×224, batch-48 run made only about 359 optimizer updates per
-epoch, compared with 2,153 at batch 8. The smaller input also removes fine
-scanner-specific detail and makes each receptive field cover more of the
-brain. A 96×96, batch-8 run later reached 100% training accuracy but
-generalised worse than 64×64, suggesting that batch 8 improved optimization
-while the lower resolution also acted as useful regularisation. Because image
-size and batch size changed together initially, their effects were not fully
-isolated.
+The twenty epochs after the best checkpoint show why this matters.
+Between epoch 27 and epoch 47 training accuracy rose from 78.6% to 85.0% while validation loss worsened from 0.4690 to 0.5436, so the model was fitting the training split and generalising less well with every epoch.
 
-## Regularised small-input experiment
+**Checkpointing on loss rather than accuracy.** The saved weights checkpoint is the one with the lowest validation loss, not the one with the highest validation accuracy, which. This is since loss is sensitive to how confident each prediction is.
 
-The 64×64 run reached 100% training and 80.53% validation accuracy but
-overfit. `superseded/train_regularized.py` adds stochastic depth `0.1` back, increases
-weight decay to `0.05`, and adds label smoothing `0.1`. It saves the best
-validation-accuracy checkpoint for final testing.
+### Data Split
 
-## 96×96 experiment
+**Testing.** The ADNI data arrives already divided into `train` and `test` directories, and is used unchanged. The test set is not used in training, 
 
-`superseded/train_regularized_96.py` keeps batch size 8 and the same regularisation while
-increasing the resized input to 96×96. It uses `bfloat16` on the A100 and stops
-immediately if a loss or gradient becomes non-finite.
+**Training and validation.** The supplied training set is divided 80/20 into training and validation. The split is made **by patient**, not by scan or by slice, and it is divided by diagnosis so that 20% of the AD patients and 20% of the NC patients are held out independently.
 
-## MRI augmentation experiment
+Earlier trial runs contained no repeated scans or images and still leaked. This was because the metadata was not considered which showed 109 patients with different scans on both sides of the split. The leakage was class-skewed, with 95 of 101 validation AD scans coming from patients seen during training compared with only 104 of 223 test AD scans. The consequence was a validation accuracy of 88.70% against a test accuracy of 72.66% with 57.22% AD recall, so validation was not truly measuring generalisation to unseen patients.
 
-`superseded/train_augmented.py` returns to 64×64 inputs and keeps ConvNeXt-Tiny unchanged.
-Training slices receive small random rotations, translations, scaling,
-intensity variation and Gaussian noise before normalization. Validation and
-test preprocessing remains deterministic.
+**Balanced epoch sampling.** Splitting by patient still leaves unbalanced batches, because AD patients have far more scans each than NC patients: 3.36 against 1.32 in the training split.
+Sampling slices at random would therefore let a handful of heavily scanned AD patients dominate their own class.
+Each epoch instead draws an equal number of slices per diagnosis, then an equal number per patient within each diagnosis. Patients with few slices are repeated and patients with many are subsampled.
 
-## Validation split finding
+**Exclusions.** Scan `1012896` is removed before splitting because its supplied slice `1012896_94.jpeg` contains no usable foreground. The exclusion is a command-line default rather than a hidden constant, and it is printed at the start of every run. 
 
-The split contains no repeated scans or images, but metadata showed that 109
-patients have different scans in both training and validation. This overlap is
-class-skewed: 95 of 101 validation AD scans are from patients seen during
-training, compared with only 104 of 223 test AD scans. This likely inflated
-validation accuracy to 88.70% while test accuracy reached 72.66% with 57.22%
-AD recall. Future model selection should use a diagnosis-stratified,
-patient-grouped validation split while retaining slice-level classification
-and the supplied test set.
+## Quantitative benchmarking against the baseline
 
-## Generalisation experiment
+The shallow CNN in `basic_cnn/` is run through the same `train.py` pipeline as ConvNeXt, so the split, sampler, pre-processing, regularisation, scheduler and threshold selection are the same.
+This CNN differs from the smoke-test basic CNN, which was a scan-level model that averaged the features of 12 slices into a single prediction per scan.
+The baseline used here keeps the same model but removes that averaging, so it takes the same 2.5D triplet input and returns one prediction per centre slice, exactly as ConvNeXt does.
+ConvNeXt-Tiny has 27,821,666 parameters against 14,114.
 
-`superseded/train_generalized.py` keeps ConvNeXt-Tiny and 64×64 slice classification but
-uses a diagnosis-stratified patient split, balances diagnoses and patients
-within each training epoch, and normalizes each slice from its own brain
-foreground. Training uses mild spatial and intensity augmentation without
-flipping anatomical laterality. The AD threshold is selected using validation
-balanced accuracy before test inference. Scan `1012896` is excluded before
-splitting because its supplied slice `1012896_94.jpeg` has no usable
-foreground. It ran all 100 cosine-scheduled epochs while saving the best
-validation-loss weights.
+### Test set results
 
-## MixUp and EMA experiment
+| Metric | ConvNeXt-Tiny | Basic CNN | Difference |
+| --- | ---: | ---: | ---: |
+| Accuracy | 71.22% | 70.34% | +0.88 |
+| Balanced accuracy | 71.10% | 70.38% | +0.72 |
+| Precision | 78.77% | 68.48% | +10.29 |
+| Recall | 57.40% | 74.39% | -16.99 |
+| Specificity | 84.80% | 66.37% | +18.43 |
+| F1 | 66.41% | 71.32% | -4.91 |
+| ROC-AUC | 0.8107 | 0.7714 | +0.0393 |
+| Validation accuracy | 78.71% | 75.94% | +2.77 |
 
-`superseded/train_mixup_ema.py` keeps the same slice-level model and patient split while
-adding batch MixUp to reduce memorisation. Validation and checkpoint selection
-use exponential moving-average model weights. Early stopping is retained and
-the best validation-loss weights are used for test inference.
+Between the two models, both stopped training due to early-stopping and ended up with similar accuracy with the baseline even performing better on recall and F1.
+The main difference between the two is the ROC-AUC, which is the area under the curve shown below.
+Unlike every other metric in the table it does not depend on the chosen threshold, and it is the probability that a random AD slice is scored higher than a random NC slice: 81.1% for ConvNeXt against 77.1% for the baseline.
 
-## 2.5D input experiment
+![Test ROC curves for both models](./figures/test_roc_curve.svg)
 
-The final `train.py` replaces the three duplicated grayscale channels with the
-previous, centre and next slices from the same scan. The centre slice keeps its
-original label and remains one test prediction, so no scan-level averaging is
-introduced. The first and last slices repeat their nearest available edge
-slice. Splitting still happens before triplets are created, preventing context
-from crossing training, validation or scan boundaries. The model and remaining
-MixUp/EMA settings are unchanged. The final run uses validation-plateau
-learning-rate reductions instead of the slower fixed cosine schedule.
+Looking at the ROC curves, ConvNeXt lies above the baseline at essentially every threshold, so it offers more recall than the baseline at any threshold a deployment might choose.
 
-The experiment also reports a secondary high-sensitivity operating point. Its
-threshold is selected on validation data to achieve at least 95% AD recall
-while retaining as much specificity as possible, then applied unchanged to the
-test set. This reflects a screening use case where missing a potential positive
-case is more costly, but it is an experimental comparison rather than a
-clinically validated diagnostic rule.
+![ConvNeXt-Tiny test metrics](./figures/convnext/test_metric_comparison.svg)
+![Basic CNN test metrics](./figures/basic_cnn/test_metric_comparison.svg)
+
+### Overfitting and model capacity
+
+The training curves show the clearest difference between the two.
+
+| | ConvNeXt-Tiny | Basic CNN |
+| --- | ---: | ---: |
+| Epochs run (early stopped) | 47 | 85 |
+| Best epoch | 27 | 65 |
+| Training accuracy at best epoch | 78.6% | 73.9% |
+| Training accuracy at final epoch | 85.0% | 74.3% |
+| Validation loss, best to final | 0.4690 to 0.5436 | 0.4821 to 0.4933 |
+
+After its best epoch ConvNeXt kept fitting the training split, gaining 6.4 points of training accuracy while validation loss degraded by 0.075 and accuracy stagnated.
+The shallow CNN gained 0.4 points over its final 20 epochs and its validation loss barely moved, because at 14,114 parameters it does not have the capacity to memorise 16,940 slices. 
+Earlier ConvNeXt runs make the same point. Before the full regularisation set was added, the 64x64 run reached 100% training accuracy with 80.53% validation accuracy, memorising the training split outright while generalising no better than the current run does. Stochastic depth, label smoothing, MixUp and weight decay are what keep the final run at 85% training accuracy rather than 100%.
+
+![ConvNeXt-Tiny training curves](./figures/convnext/training_curves.svg)
+![Basic CNN training curves](./figures/basic_cnn/training_curves.svg)
+
+### Splitting predictions by confidence
+
+Because ConvNeXt's probabilities are more trustworthy, its two thresholds can be used to split the test slices into three groups instead of forcing a single AD or NC answer on every slice.
+
+| Group | Rule | Slices | Share | How often it is right |
+| --- | --- | ---: | ---: | ---: |
+| Very likely AD | P(AD) at or above 0.648 | 3,250 | 36.1% | 78.8% |
+| Needs a specialist to look | between 0.172 and 0.648 | 2,854 | 31.7% | not answered |
+| Very likely NC | P(AD) below 0.172 | 2,896 | 32.2% | 82.1% |
+
+The two outer groups cover 68.3% of the test set and ConvNeXt gets 80.3% of them right, compared with 71.2% when it is forced to label every slice.
+Handing the middle group to a specialist is therefore worth 9.1 points of accuracy on everything that is left.
+
+The basic CNN can be split the same way, but it gains very little from it.
+Its two thresholds sit close together at 0.254 and 0.381, so only 14.9% of slices fall in the middle group, and its accuracy on the rest is 71.8% against 70.3% overall, a gain of 1.4 points instead of 9.1.
+
+Both models label slices about equally well, but ConvNeXt can also tell which of its own answers are unreliable.
+
+## Engineering recommendation and trade-off synthesis
+
+This section answers the brief's triage dilemma directly: whether the model's confidence score is trustworthy enough to automate part of the workload, and what it would cost to deploy.
+
+### Recommendation
+
+**Deploy the model as a three-zone triage filter rather than as a classifier.**
+Using the two thresholds the pipeline already selects on validation data, the system can automate 68.3% of incoming slices at 80.3% accuracy and refer the remaining 31.7% to a human reviewer.
+That automated accuracy clears the project's 80% target, which single-threshold classification does not: at a single balanced threshold the same model achieves only 71.2%.
+The gain comes from declining to answer, not from a better model.
+
+### Evidence that the confidence score is informative
+
+Splitting the 9,000 test slices at the two selected thresholds produces three zones with very different reliability.
+
+| Zone | Rule | Slices | Share | Accuracy in zone |
+| --- | --- | ---: | ---: | ---: |
+| Auto-report AD | P(AD) >= 0.648 | 3,250 | 36.1% | 78.8% (precision) |
+| Refer to specialist | 0.172 <= P(AD) < 0.648 | 2,854 | 31.7% | not applicable |
+| Auto-clear NC | P(AD) < 0.172 | 2,896 | 32.2% | 82.1% (negative predictive value) |
+
+The referral band contains 1,381 AD and 1,473 NC slices, an AD rate of 48.4% against a test-set base rate of 49.6%.
+Inside that band the model's output carries essentially no diagnostic information, and a prediction there is indistinguishable from a coin flip weighted by prevalence.
+Outside the band the same model is right four times in five.
+
+This is the central finding for the dilemma.
+The network is **not** uniformly overconfident: its probability output separates the cases it can answer from the cases it cannot, and the separation is sharp enough to act on.
+A reject-option rule is therefore justified by the data rather than adopted as a precaution.
+
+### The operating-point trade-off
+
+Both thresholds are selected on validation probabilities and applied unchanged to the test set.
+Neither is adequate on its own, which is why the recommendation combines them.
+
+| Metric (test set) | Balanced accuracy point (0.648) | High sensitivity point (0.172) |
+| --- | ---: | ---: |
+| Accuracy | 71.2% | 70.2% |
+| Recall (AD) | 57.4% | 88.4% |
+| Specificity | 84.8% | 52.4% |
+| Precision | 78.8% | 64.6% |
+| False negatives | 1,900 | 519 |
+| False positives | 690 | 2,163 |
+
+Moving to the sensitivity-oriented threshold removes 1,381 missed AD slices, a 73% reduction in false negatives, and costs 1,473 additional false positives, a 3.1-fold increase.
+For a screening assistant that ratio is defensible, because a false positive consumes specialist review time while a false negative returns a patient to the population unexamined.
+It is not defensible as an autonomous decision rule, because specificity of 52.4% means the system rejects barely half of the genuinely normal scans and would refer most of the cohort anyway.
+
+The three-zone rule resolves this by applying each threshold only where it is reliable.
+
+### Risks the manager must accept
+
+**The recall target did not transfer from validation to test.**
+The high-sensitivity threshold was selected to reach at least 95% AD recall on validation and delivered 95.0% there, but only 88.4% on the test set.
+A recall figure measured on validation cannot be promised as a service level, and any deployment must re-derive its thresholds on a labelled sample from the target cohort.
+
+**Validation remains optimistic even after the leakage fix.**
+Validation accuracy is 78.7% against 71.2% on test, a 7.5 point gap.
+This is a substantial improvement on the 16 point gap produced by the earlier scan-level split, so patient-level grouping fixed most of the problem, but not all of it.
+The residual gap is consistent with genuine cohort difference rather than leakage: AD patients contribute 3.36 scans each in the training split and only 1.70 in the supplied test set, so the two populations are not sampled the same way.
+
+**519 AD slices are still auto-cleared.**
+The auto-clear zone has a negative predictive value of 82.1%, so roughly one in six slices it clears is actually AD.
+This residual must be covered by a scan-level or patient-level review policy, not by the slice-level model alone.
+
+### Prioritised next steps
+
+| Priority | Action | Expected benefit | Cost |
+| --- | --- | --- | --- |
+| 1 | Aggregate the 20 slice probabilities per scan into one scan-level score | Large. Averaging 20 correlated predictions should cut variance substantially, and the clinical unit of decision is the scan, not the slice | Negligible. No retraining, no extra inference, a few lines of post-processing |
+| 2 | Re-derive thresholds on a held-out slice of the deployment cohort | Restores the recall guarantee that failed to transfer | One labelled batch per cohort |
+| 3 | Calibrate probabilities, for example by temperature scaling on validation | Makes thresholds portable and the confidence score interpretable as a probability | Hours. One scalar fitted post hoc |
+| 4 | Run the missing 224x224 batch-8 control | Isolates whether batch size or input resolution removed the training plateau, which determines where further capacity should be spent | One training run |
+| 5 | Evaluate ImageNet-pretrained initialisation | The 7.5 point validation-to-test gap and 71.2% ceiling both point at limited data rather than limited capacity | One training run, but departs from the from-scratch constraint of this project |
+
+Step 1 is the clear priority.
+Every design decision in this project deliberately kept predictions at slice level, and the measured consequence is that the system makes 20 independent, highly correlated decisions per scan and never combines them.
+
+### Does the added complexity justify itself?
+
+ConvNeXt-Tiny uses 27,821,666 parameters against 14,114 for the shallow CNN baseline, a factor of 1,971.
+The two models are compared on an identical data protocol, loss, optimizer schedule and evaluation, so the only variable is the network.
+
+The decision rule for the manager is operational rather than academic.
+The advanced model is justified only if its separation of confident from ambiguous cases is materially better than the baseline's, because that separation, not raw accuracy, is what produces the automation saving.
+A baseline that reaches comparable accuracy but cannot identify its own ambiguous cases provides no triage capability, and would not be the cheaper option despite its size.
+The measured comparison is reported in the benchmarking section and should be read against that criterion.
 
 ## References
 
