@@ -43,4 +43,4 @@ shared_args=(
 
 python -u -m basic_cnn.train "${shared_args[@]}" "$@"
 python -u -m basic_cnn.evaluate "${shared_args[@]}" "$@"
-python -u -m basic_cnn.plot_metrics --metrics basic_cnn/output/metrics.json
+python -u plot_metrics.py --metrics basic_cnn/output/metrics.json --model-name "Basic CNN"
