@@ -1,4 +1,4 @@
-"""Create dependency-free SVG plots from the shallow-CNN metrics JSON."""
+"""Create dependency-free SVG plots from any run's metrics JSON."""
 
 from __future__ import annotations
 
@@ -7,9 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from train import save_training_curves
-
-from basic_cnn.common import DEFAULT_OUTPUT_DIR
+from train import DEFAULT_OUTPUT_DIR, save_training_curves
 
 
 METRIC_KEYS = (
@@ -31,12 +29,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR / "metrics.json",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--model-name",
+        default="ConvNeXt-Tiny",
+        help="Model name used in the plot titles.",
+    )
     return parser.parse_args()
 
 
 def _metric_bar_svg(
     primary: dict[str, float],
     secondary: dict[str, float] | None,
+    model_name: str = "ConvNeXt-Tiny",
 ) -> str:
     width, height = 1100, 540
     left, top, chart_width, chart_height = 75, 80, 965, 340
@@ -46,7 +50,7 @@ def _metric_bar_svg(
     elements = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#fafafa"/>',
-        '<text x="550" y="35" text-anchor="middle" font-size="25" font-weight="bold">Basic CNN Test Metrics</text>',
+        f'<text x="550" y="35" text-anchor="middle" font-size="25" font-weight="bold">{model_name} Test Metrics</text>',
     ]
     for tick in range(6):
         score = tick / 5
@@ -143,7 +147,7 @@ def main() -> None:
         path = save_training_curves(
             history,
             output_dir,
-            plot_title="Basic CNN Training History",
+            plot_title=f"{args.model_name} Training History",
         )
         print(f"Training curves saved to: {path}")
 
@@ -152,14 +156,14 @@ def main() -> None:
     secondary = target_report.get("test") if target_report else None
     summary_path = output_dir / "test_metric_comparison.svg"
     summary_path.write_text(
-        _metric_bar_svg(primary, secondary),
+        _metric_bar_svg(primary, secondary, args.model_name),
         encoding="utf-8",
     )
     print(f"Metric comparison saved to: {summary_path}")
 
     primary_path = output_dir / "test_confusion_matrix.svg"
     primary_path.write_text(
-        _confusion_matrix_svg(primary, "Basic CNN Test Confusion Matrix"),
+        _confusion_matrix_svg(primary, f"{args.model_name} Test Confusion Matrix"),
         encoding="utf-8",
     )
     print(f"Confusion matrix saved to: {primary_path}")
@@ -169,7 +173,7 @@ def main() -> None:
         recall_path.write_text(
             _confusion_matrix_svg(
                 secondary,
-                "Basic CNN High-Recall Confusion Matrix",
+                f"{args.model_name} High-Recall Confusion Matrix",
             ),
             encoding="utf-8",
         )
