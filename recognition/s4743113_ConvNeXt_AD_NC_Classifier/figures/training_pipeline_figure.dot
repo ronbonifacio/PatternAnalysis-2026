@@ -1,0 +1,25 @@
+digraph TrainingPipeline {
+    graph [rankdir=TB, bgcolor="#ffffff", pad="0.3", nodesep="0.35", ranksep="0.40", splines=polyline];
+    node [shape=box, style=filled, fillcolor="#ffffff", color="#000000", penwidth=1.3,
+          fontname="Arial", fontsize=13, fontcolor="#000000", margin="0.22,0.14", width=3.6];
+    edge [color="#000000", penwidth=1.1, arrowsize=0.8, fontname="Arial", fontsize=12];
+
+    IN [label="Input: ADNI MRI scans and patient metadata", style="rounded,filled"];
+    A  [label="Class balanced and patient level\ntraining/validation split from training set"];
+    B  [label="Diagnosis and patient balanced epoch sampling\nof previous/centre/next slice"];
+    C  [label="Crop foreground and resize image to 64x64"];
+    D  [label="Shared image augmentation, foreground only\nnormalization per channel and MixUp (batch of 8)"];
+    E  [label="ConvNeXt-Tiny forward pass and\nlabel-smoothed cross-entropy loss"];
+    F  [label="Backpropagation, gradient clipping\nand AdamW step"];
+    G  [label="EMA weight update"];
+    H  [label="Validation using EMA weights"];
+    I  [label="Best-checkpoint selection, validation-plateau\nscheduler and early stopping"];
+    OUT [label="Output: best EMA checkpoint", shape=parallelogram, width=2.6, height=0.62, margin="0.10,0.06"];
+
+    IN -> A -> B -> C -> D -> E -> F -> G;
+    G -> D [label="Next batch\n\n\n", constraint=false];
+    G -> H;
+    H -> I;
+    I -> B [label="\n\n\nNext epoch", constraint=false];
+    I -> OUT [label="  Training complete"];
+}

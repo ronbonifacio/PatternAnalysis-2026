@@ -1,22 +1,96 @@
-# ADNI ConvNeXt-Tiny classifier
+# Preparing a ConvNeXt Model for Neuroimaging, AD vs NC Classification
 
-This project uses a layer-by-layer PyTorch implementation of ConvNeXt-Tiny to
-classify ADNI MRI slices as Alzheimer's disease (AD) or normal control (NC).
-The model uses adjacent slices as a 2.5D input and follows the official
-TorchVision architecture without instantiating a prebuilt model or using
-pretrained weights.
+This project uses a layer-by-layer PyTorch implementation of ConvNeXt-Tiny to classify ADNI MRI slices as either Alzheimer's disease (AD) or normal cognition (NC).
+The model uses a central slice and its left and right adjacent slices of an MRI scan as a 2.5D input into the model and follows the official TorchVision model architecture without using a prebuilt model or using pretrained weights. The code for the ConvNeXt-Tiny model layers was taken and adapted from the pytorch/vision repository at https://github.com/pytorch/vision/blob/main/torchvision/models/convnext.py. OpenAI's GPT-5.6 Sol (`gpt-5.6-sol`) was used as a prompting and coding assistant during development to help draft prompts, implement and debug code, and refine the project documentation.
+
+The implementation foreground-centres and resizes each MRI slice, applies foreground only normalisation to each input channel separately and image augmentation that is shared between input channels, and uses patient separated training and validation data splits from the supplied training set with diagnosis and patient balanced sampling utilising the metadata. ConvNeXt-Tiny is trained from scratch in batches of eight using AdamW, label smoothing, stochastic depth, mixed precision, gradient clipping and MixUp, while exponential moving-average weights are used for validation, checkpoint selection and final inference. The learning rate uses linear warm-up followed by reductions on validation loss plateaus and early stopping. Validation results select both a balanced accuracy classification threshold and a high AD recall threshold before evaluation on the held-out test set.
+
+The following figure shows the inference pipeline for a single MRI slice.
+
+![Inference pipeline for a single MRI slice](./figures/inference_pipeline.jpg)
+
+The following figure shows the training pipeline for a single MRI slice.
+
+![Training pipeline for a single MRI slice](./figures/training_pipeline_figure.jpg)
+
+(Training pipeline figure generated with GPT-5.6 Sol)
+
+## Dataset structure
+
+The supplied ADNI data is organised as three nested levels: patients own scans, and scans own slices.
+Each slice is a 256x240 grayscale JPEG named `<scan id>_<slice index>.jpeg`, so `218391_78.jpeg` is slice 78 of scan `218391`, and that scan contributes exactly 20 consecutive slices numbered 78 to 97.
+`meta_data_with_label.json` maps each scan id to its originating patient, for example scan `932015` belongs to patient `068_S_0473`, which is the only way to tell that two differently numbered scans come from the same person.
+The supplied training set holds 1,076 scans (21,520 slices) from 565 patients, and the held-out test set holds 450 scans (9,000 slices) from 331 patients, split into AD and NC folders.
+
+## Written Feasibility Report
+
+The following is the written feasibility report completed at the midpoint of the project on the 13/10/2026. It outlines the basic acceptance criteria of the project and core concepts for the ConvNeXt model.
+
+It is important to note that the basic shallow CNN smoketest completed within this feasibility report utilised a different input and output architecture compared with the final model. This was that it was a scan-level classifier that made predictions based on the average of 12 slices from a scan, rather than a slice-level classifier that makes predictions based on a single slice and its adjacent slices like the final model. The change to the slice-level classifier was made afterwards, with the driving reason being that at the beginning of the project, the model had trouble learning the training data and was underfitting. I thought a reason for this was that the model did not have enough training samples to learn from and thus the scan-level sample size of 1076 was increased to a slice-level sample size of 21,520.
+
+## Feasibility Report: Preparing a ConvNeXt Model for Neuroimaging, AD vs NC Classification
+
+### 1. User Need Scope & Acceptance Criteria
+
+- **User Scope:** The intended users are medical researchers or healthcare professional who may use the model to assist them in diagnosing patients from the MRI scans.
+- The prototype model will be used to determine if a ConvNext model is useful for the classification context, and if the heavier model provides value over a basic CNN classifier.
+- **Acceptance Criteria:** Aim for 80% minimum test accuracy. Aim for High Recall at least 95%. Model can be trained within the hardware constraints set by the Rangpur HPC, peak VRAM < 40GB.
+
+### 2. Model Choice & Core Concepts
+
+- Dataset configuration will be used with the originally provided train/test split. Training set will be divided into an 80/20 training/validation set using the validation performance to tune hyperparameters of the model. Final inference will then be run on the test set to determine the true performance of the model.
+- ConvNeXt (Difficulty Band Hard) model architecture will be used. Driving reason for this being that they are known to match or outperform conventional CNNs. They use large depth wise kernels, wide hidden layers, and less activation functions to mimic the behaviour of a transformer.
+  - This leads to the purpose of the research task being if this heavier model has an improvement over conventional CNNS for the AD vs NC application.
+- It is recommended that the model would be used in conjunction with professional opinion as this is a safety critical application. As a result:
+  - We **aim for high recall** as a misclassified AD would be detrimental to the patient.
+
+### 3. Preliminary Feasibility Evidence
+
+- Dataset is provided as a separated training and test set with clear distinctions of patient numbers and MRI images in the format of &lt;patient_number&gt;\_&lt;image_number&gt;.
+  - This can be used to ensure patient-level separation of the data.
+- A smoke test with a shallow CNN was created to judge the effectiveness of a basic CNN model. The result was trained on my laptop on CPU, achieving a validation accuracy of 80% after 46 epochs completing training within the hour. Results are in the appendix.
+
+### 4. Risk Budget and Fallback
+
+Risks include:
+
+- Patient-level data leakage. It is important to ensure that during training of the model that data is loaded correctly otherwise it is likely that the model will overfit on train set, provide poor inference on the test set or produce incorrect metrics.
+  - To mitigate this risk it is important to view results carefully.
+- Training Risk: Training of the heavier ConvNeXt model may take a long time so it is important that adequate time is provided to train the model on the Rangpur HPC. Adequate time must be allocated for model training, inference, performance evaluation and interpretation of results within the project deadline.
+  - If training is incomplete/the model resulted in poor performance, the fallback is to still perform the evaluation and comparison to the basic CNN on the model that we ended up with.
+
+### Appendix, Smoke Test Results:
+
+![Smoke Test Confusion Matrix](./figures/smoke_test_confusion_matrix.png)
+
+## Dependencies
+
+The following tables lists the project dependencies.
+
+| Package | Version | Required | Used for |
+| --- | --- | --- | --- |
+| Python | 3.11.15 | yes |  |
+| PyTorch | 2.13.0 | yes | Deep learning framework: the model, training loop, data loading and GPU support |
+| Pillow | 12.3.0 | yes | Image reading and writing |
+| Matplotlib | 3.11.1 | optional | Result plots only |
+
+Matplotlib is imported inside a `try`/`except ImportError` block in `save_training_curves`.
+If it is missing, training still completes and every metric is still printed and written to `metrics.json` however the plots are skipped.
+
+### Hardware
+
+The reported results were produced on a single NVIDIA A100 on the Rangpur HPC.
 
 ## Running the project
 
-On the course cluster, submit the final experiment with:
+On the course cluster, submit the training experiment  with:
 
 ```bash
 sbatch train_convnext.sh
 ```
 
-Weights, JSON metrics, confusion matrices and `training_curves.svg` are saved
-under `output/convnext_tiny_64px_2_5d_plateau`. After training, example test
-predictions and a labelled image grid can be produced with:
+Weights, JSON metrics, confusion matrices and `training_curves.svg` are saved under `output/convnext_tiny_64px_2_5d_plateau`.
+After training, example test predictions and a labelled image grid can be produced with:
 
 ```bash
 python predict.py \
@@ -24,6 +98,48 @@ python predict.py \
   --metadata-path /home/groups/comp3710/ADNI/meta_data_with_label.json \
   --device cuda
 ```
+
+To re-score the metrics of an existing checkpoint without training, add `--evaluate-only` to `train.py`.
+
+## Example inputs and outputs
+
+Running `predict.py` saves a labelled grid of test examples to `output/convnext_tiny_64px_2_5d_plateau/prediction_examples.png`.
+A copy is reproduced below.
+
+![Example test predictions with AD probabilities](./figures/prediction_examples.png)
+
+Each panel shows the centre slice of one 2.5D input as the model sees it, after the foreground crop, the resize to 64x64 and per-channel foreground normalisation.
+The previous and next slices occupy the other two channels and are not displayed.
+The caption gives the slice identifier, the true diagnosis, the predicted AD probability, and the decision taken at each of the two validation-selected operating points.
+
+An example of the matching console output is:
+
+```
+1003730_88: actual=AD, P(AD)=0.204, balanced=NC, 95% validation recall=AD
+1003730_89: actual=AD, P(AD)=0.213, balanced=NC, 95% validation recall=AD
+1003730_90: actual=AD, P(AD)=0.519, balanced=NC, 95% validation recall=AD
+1003730_91: actual=AD, P(AD)=0.456, balanced=NC, 95% validation recall=AD
+```
+
+These eight examples are the first eight slices the test loader returns rather than a random sample, so they all belong to scan `1003730` and show consecutive slices 88 to 95 of the same brain.
+They are informative for exactly that reason.
+Every slice is truly AD, every predicted probability sits between 0.20 and 0.52, and the two operating points therefore disagree on all eight: the balanced-accuracy threshold calls them NC and the high-recall threshold calls them AD.
+At the balanced operating point these are eight consecutive false negatives from one scan.
+
+Two properties of the model are visible here.
+Predictions are made independently per slice, yet the probabilities move smoothly across neighbouring slices (0.204, 0.213, 0.519, 0.456, 0.247, 0.237, 0.323, 0.325), which is the expected consequence of adjacent slices sharing most of their anatomy through the 2.5D input.
+The probabilities also sit well below 0.5 for a genuinely AD scan, which is the behaviour the secondary high-sensitivity operating point exists to address: lowering the threshold recovers all eight at the cost of specificity elsewhere.
+
+## Reproducibility
+
+Two seeds control the run, and both are recorded in `metrics.json` alongside the full configuration.
+
+| Flag | Default | Controls |
+| --- | --- | --- |
+| `--seed` | `42` | the patient-level train/validation split only (`_patient_stratified_split`) |
+| `--training-seed` | `123` | model initialization, epoch sampling order, augmentation, MixUp and DataLoader shuffling |
+
+Scan `1012896` is excluded before splitting because its slices contain no usable foreground.
 
 ## Superseded subject-level experiment
 
