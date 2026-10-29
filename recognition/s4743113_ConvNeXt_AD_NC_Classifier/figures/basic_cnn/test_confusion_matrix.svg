@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="560" viewBox="0 0 540 560">
+<rect width="100%" height="100%" fill="#fafafa"/>
+<text x="270" y="32" text-anchor="middle" font-size="22" font-weight="bold">Basic CNN Test Confusion Matrix</text>
+<text x="270" y="60" text-anchor="middle" font-size="15">Threshold 0.3809</text>
+<text x="250" y="525" text-anchor="middle" font-size="17">Predicted class</text>
+<text x="60" y="295" text-anchor="middle" font-size="17" transform="rotate(-90 60 295)">Actual class</text>
+<text x="250" y="95" text-anchor="middle" font-size="16">NC</text>
+<text x="440" y="95" text-anchor="middle" font-size="16">AD</text>
+<text x="135" y="205" text-anchor="end" font-size="16">NC</text>
+<text x="135" y="395" text-anchor="end" font-size="16">AD</text>
+<rect x="155" y="105" width="190" height="190" fill="#1764aa" fill-opacity="0.831"/>
+<text x="250" y="210" text-anchor="middle" font-size="29" font-weight="bold" fill="white">3,013</text>
+<rect x="345" y="105" width="190" height="190" fill="#1764aa" fill-opacity="0.495"/>
+<text x="440" y="210" text-anchor="middle" font-size="29" font-weight="bold" fill="#172033">1,527</text>
+<rect x="155" y="295" width="190" height="190" fill="#1764aa" fill-opacity="0.408"/>
+<text x="250" y="400" text-anchor="middle" font-size="29" font-weight="bold" fill="#172033">1,142</text>
+<rect x="345" y="295" width="190" height="190" fill="#1764aa" fill-opacity="0.900"/>
+<text x="440" y="400" text-anchor="middle" font-size="29" font-weight="bold" fill="white">3,318</text>
+</svg>
