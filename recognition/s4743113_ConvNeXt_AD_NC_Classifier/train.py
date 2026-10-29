@@ -1052,6 +1052,7 @@ def main(
     last_weights_path = args.output_dir / "last_model_weights.pt"
     last_ema_weights_path = args.output_dir / "last_ema_model_weights.pt"
     metrics_path = args.output_dir / "metrics.json"
+    # Fail here rather than after the loaders and model have been built.
     if args.evaluate_only and not best_weights_path.is_file():
         raise FileNotFoundError(
             f"Cannot evaluate because the best weights do not exist: "
@@ -1200,6 +1201,9 @@ def main(
         )
         return validation_report, test_metrics, target_recall_report
 
+    # Re-score the saved checkpoint and return before any optimizer, scheduler
+    # or EMA state exists. Results go to test_metrics.json so that re-scoring
+    # cannot overwrite the metrics.json written by the run that trained them.
     if args.evaluate_only:
         print(f"Evaluation only; loading weights from: {best_weights_path}")
         model.load_state_dict(

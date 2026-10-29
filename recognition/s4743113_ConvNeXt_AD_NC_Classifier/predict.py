@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 from PIL import Image, ImageDraw
+from torch.utils.data import DataLoader, Subset
 
 from dataset import (
     FULL_FOREGROUND_CROP_SIZE,
@@ -45,6 +46,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--examples", type=int, default=8)
+    parser.add_argument(
+        "--example-seed",
+        type=int,
+        default=42,
+        help="Seed selecting which test slices are shown.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
@@ -179,9 +186,30 @@ def main() -> None:
     for name, threshold in operating_points:
         print(f"{name} threshold: {threshold:.4f}")
 
+    # Sample across the whole test set instead of taking the first slices the
+    # loader returns, which would all come from one scan.
+    example_count = min(args.examples, len(test_dataset))
+    selection_generator = torch.Generator().manual_seed(args.example_seed)
+    selected_indices = sorted(
+        torch.randperm(len(test_dataset), generator=selection_generator)[
+            :example_count
+        ].tolist()
+    )
+    example_loader = DataLoader(
+        Subset(test_dataset, selected_indices),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    print(
+        f"Showing {example_count} random test slices "
+        f"(example seed {args.example_seed})"
+    )
+
     examples: list[dict[str, object]] = []
     with torch.inference_mode():
-        for batch in test_loader:
+        for batch in example_loader:
             images = batch["image"]
             logits = model(images.to(device, non_blocking=True))
             ad_index = test_dataset.class_to_idx["AD"]
@@ -208,10 +236,6 @@ def main() -> None:
                         ),
                     }
                 )
-                if len(examples) >= args.examples:
-                    break
-            if len(examples) >= args.examples:
-                break
 
     visualization_path = args.output_dir / "prediction_examples.png"
     save_prediction_grid(examples, visualization_path)
