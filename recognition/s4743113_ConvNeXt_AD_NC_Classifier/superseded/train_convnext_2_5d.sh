@@ -24,7 +24,7 @@ else
 fi
 
 cd "${train_dir}"
-mkdir -p output/convnext_tiny_64px_2_5d
+mkdir -p output/convnext_tiny_64px_2_5d_plateau
 
 echo "SLURM job: ${SLURM_JOB_ID:-not available}"
 echo "Host: $(hostname)"

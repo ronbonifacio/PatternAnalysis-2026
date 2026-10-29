@@ -19,6 +19,7 @@ always taken from the first directory below ``train`` or ``test``.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 from collections import defaultdict
@@ -30,6 +31,7 @@ from typing import Callable, Mapping, Sequence
 import torch
 from PIL import Image
 from torch import Tensor
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 
@@ -37,6 +39,7 @@ _SLICE_NAME = re.compile(r"^(?P<sample>.+)_(?P<slice>\d+)$")
 _PATIENT_NAME = re.compile(r"ADNI_(?P<patient>\d{3}_S_\d{4})")
 _IMAGE_SUFFIXES = {".jpg", ".jpeg"}
 _FOREGROUND_THRESHOLD = 10 / 255
+FULL_FOREGROUND_CROP_SIZE = (224, 224)
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,124 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def resize_tensor_image(image: Tensor, *, size: int) -> Tensor:
+    """Resize a CHW tensor to a square without taking another crop."""
+
+    if image.shape[-2:] == (size, size):
+        return image
+    return F.interpolate(
+        image.unsqueeze(0),
+        size=(size, size),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    ).squeeze(0)
+
+
+class MRITrainAugmentation:
+    """Apply shared spatial and intensity variation to a 2D/2.5D MRI input."""
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        rotation_degrees: float,
+        translation_fraction: float,
+        scale_jitter: float,
+        intensity_jitter: float,
+        noise_standard_deviation: float,
+        horizontal_flip_probability: float = 0.0,
+        gamma_jitter: float = 0.0,
+    ) -> None:
+        self.size = size
+        self.rotation_degrees = rotation_degrees
+        self.translation_fraction = translation_fraction
+        self.scale_jitter = scale_jitter
+        self.intensity_jitter = intensity_jitter
+        self.noise_standard_deviation = noise_standard_deviation
+        self.horizontal_flip_probability = horizontal_flip_probability
+        self.gamma_jitter = gamma_jitter
+
+    @staticmethod
+    def _uniform(low: float, high: float) -> float:
+        return torch.empty(()).uniform_(low, high).item()
+
+    def __call__(self, image: Tensor) -> Tensor:
+        image = resize_tensor_image(image, size=self.size)
+        if torch.rand(()).item() < self.horizontal_flip_probability:
+            image = image.flip(-1)
+
+        angle = math.radians(
+            self._uniform(-self.rotation_degrees, self.rotation_degrees)
+        )
+        desired_scale = self._uniform(
+            1.0 - self.scale_jitter,
+            1.0 + self.scale_jitter,
+        )
+        translation_x = 2.0 * self._uniform(
+            -self.translation_fraction,
+            self.translation_fraction,
+        )
+        translation_y = 2.0 * self._uniform(
+            -self.translation_fraction,
+            self.translation_fraction,
+        )
+        cosine = math.cos(angle) / desired_scale
+        sine = math.sin(angle) / desired_scale
+        theta = image.new_tensor(
+            [
+                [cosine, -sine, translation_x],
+                [sine, cosine, translation_y],
+            ]
+        ).unsqueeze(0)
+        grid = F.affine_grid(
+            theta,
+            size=(1, image.shape[0], self.size, self.size),
+            align_corners=False,
+        )
+        image = F.grid_sample(
+            image.unsqueeze(0),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).squeeze(0)
+
+        foreground = image.amax(dim=0, keepdim=True) > _FOREGROUND_THRESHOLD
+        foreground_values = image.masked_select(foreground.expand_as(image))
+        if foreground_values.numel():
+            if self.gamma_jitter:
+                gamma = self._uniform(
+                    1.0 - self.gamma_jitter,
+                    1.0 + self.gamma_jitter,
+                )
+                image = image.clamp_min(0.0).pow(gamma)
+                foreground_values = image.masked_select(
+                    foreground.expand_as(image)
+                )
+            foreground_mean = foreground_values.mean()
+            contrast = self._uniform(
+                1.0 - self.intensity_jitter,
+                1.0 + self.intensity_jitter,
+            )
+            gain = self._uniform(
+                1.0 - self.intensity_jitter,
+                1.0 + self.intensity_jitter,
+            )
+            image = (image - foreground_mean) * contrast + foreground_mean
+            image = image * gain
+            if self.noise_standard_deviation:
+                noise = torch.randn(
+                    (1, self.size, self.size),
+                    dtype=image.dtype,
+                    device=image.device,
+                ) * self.noise_standard_deviation
+                image = image + noise
+            image = torch.where(foreground, image.clamp(0.0, 1.0), 0.0)
+
+        return image
 
 
 def _seed_worker(worker_id: int) -> None:
