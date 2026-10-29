@@ -100,7 +100,6 @@ class MRITrainAugmentation:
         scale_jitter: float,
         intensity_jitter: float,
         noise_standard_deviation: float,
-        horizontal_flip_probability: float = 0.0,
         gamma_jitter: float = 0.0,
     ) -> None:
         self.size = size
@@ -109,7 +108,6 @@ class MRITrainAugmentation:
         self.scale_jitter = scale_jitter
         self.intensity_jitter = intensity_jitter
         self.noise_standard_deviation = noise_standard_deviation
-        self.horizontal_flip_probability = horizontal_flip_probability
         self.gamma_jitter = gamma_jitter
 
     @staticmethod
@@ -118,9 +116,6 @@ class MRITrainAugmentation:
 
     def __call__(self, image: Tensor) -> Tensor:
         image = resize_tensor_image(image, size=self.size)
-        if torch.rand(()).item() < self.horizontal_flip_probability:
-            image = image.flip(-1)
-
         angle = math.radians(
             self._uniform(-self.rotation_degrees, self.rotation_degrees)
         )
@@ -306,38 +301,6 @@ def _foreground_centered_crop(
     )
 
 
-def _calculate_foreground_statistics(
-    samples: Sequence[ADNISample],
-    subject_indices: Sequence[int],
-    image_size: tuple[int, int] | None,
-) -> tuple[float, float]:
-    """Calculate foreground mean/std using training subjects only."""
-
-    pixel_sum = 0.0
-    squared_pixel_sum = 0.0
-    pixel_count = 0
-
-    for subject_index in subject_indices:
-        for path in samples[subject_index].slice_paths:
-            # ADNI JPEGs are grayscale replicated across RGB, so one channel
-            # contains all unique intensity information.
-            pixels = _image_to_tensor(path, image_size)[0]
-            foreground = pixels[pixels > _FOREGROUND_THRESHOLD].double()
-            pixel_sum += foreground.sum().item()
-            squared_pixel_sum += foreground.square().sum().item()
-            pixel_count += foreground.numel()
-
-    if pixel_count == 0:
-        raise RuntimeError("Training images contain no foreground pixels")
-
-    mean = pixel_sum / pixel_count
-    variance = max(squared_pixel_sum / pixel_count - mean**2, 0.0)
-    standard_deviation = variance**0.5
-    if standard_deviation == 0.0:
-        raise RuntimeError("Training foreground has zero standard deviation")
-    return mean, standard_deviation
-
-
 class ADNISubjectIndex:
     """Index slice paths by scan before creating slice datasets."""
 
@@ -478,36 +441,12 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
         subject_dataset: ADNISubjectIndex,
         subject_indices: Sequence[int] | None = None,
         *,
-        foreground_statistics: tuple[float, float] | None = None,
-        normalize_per_slice: bool = False,
-        slice_context: int = 1,
         transform: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
         self.class_to_idx = dict(subject_dataset.class_to_idx)
         self.image_size = subject_dataset.image_size
         self.excluded_sample_ids = subject_dataset.excluded_sample_ids
-        self.foreground_statistics = foreground_statistics
-        self.normalize_per_slice = normalize_per_slice
-        self.slice_context = slice_context
         self.transform = transform
-
-        if slice_context not in {1, 3}:
-            raise ValueError("slice_context must be 1 or 3")
-
-        if foreground_statistics is not None and normalize_per_slice:
-            raise ValueError(
-                "training-set and per-slice normalization cannot both be enabled"
-            )
-
-        if foreground_statistics is not None:
-            mean, standard_deviation = foreground_statistics
-            if standard_deviation <= 0:
-                raise ValueError("foreground standard deviation must be positive")
-            self.foreground_mean = float(mean)
-            self.foreground_standard_deviation = float(standard_deviation)
-        else:
-            self.foreground_mean = None
-            self.foreground_standard_deviation = None
 
         if subject_indices is None:
             selected_indices = tuple(range(len(subject_dataset)))
@@ -570,56 +509,42 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
 
     def __getitem__(self, index: int) -> dict[str, object]:
         item = self.slices[index]
-        if self.slice_context == 3:
-            # ConvNeXt still receives three channels, but they now contain
-            # the previous, centre and next grayscale MRI slices instead of
-            # three copies of the centre slice. Context never crosses a scan.
-            image = torch.stack(
-                [
-                    _image_to_tensor(path, self.image_size)[0]
-                    for path in item.context_paths
-                ]
-            )
-        else:
-            image = _image_to_tensor(item.path, self.image_size)
+        # The channels contain the previous, centre and next grayscale MRI
+        # slices. Edge centres repeat the nearest available slice and context
+        # never crosses a scan boundary.
+        image = torch.stack(
+            [
+                _image_to_tensor(path, self.image_size)[0]
+                for path in item.context_paths
+            ]
+        )
         if self.transform is not None:
             image = self.transform(image)
         foreground = image > _FOREGROUND_THRESHOLD
-        if self.normalize_per_slice:
-            normalized_channels = []
-            for channel, channel_foreground in zip(image, foreground):
-                foreground_values = channel.masked_select(channel_foreground)
-                if foreground_values.numel() == 0:
-                    # Completely black or constant slices contain no usable
-                    # contrast and are represented by a neutral zero channel.
+        normalized_channels = []
+        for channel, channel_foreground in zip(image, foreground):
+            foreground_values = channel.masked_select(channel_foreground)
+            if foreground_values.numel() == 0:
+                # Completely black or constant context channels contain no
+                # usable contrast and are represented by neutral zeros.
+                normalized_channel = torch.zeros_like(channel)
+            else:
+                foreground_mean = foreground_values.mean()
+                foreground_standard_deviation = foreground_values.std(
+                    unbiased=False
+                )
+                minimum_standard_deviation = torch.finfo(image.dtype).eps
+                if foreground_standard_deviation <= minimum_standard_deviation:
                     normalized_channel = torch.zeros_like(channel)
                 else:
-                    foreground_mean = foreground_values.mean()
-                    foreground_standard_deviation = foreground_values.std(
-                        unbiased=False
+                    normalized_channel = torch.where(
+                        channel_foreground,
+                        (channel - foreground_mean)
+                        / foreground_standard_deviation,
+                        0.0,
                     )
-                    minimum_standard_deviation = torch.finfo(image.dtype).eps
-                    if (
-                        foreground_standard_deviation
-                        <= minimum_standard_deviation
-                    ):
-                        normalized_channel = torch.zeros_like(channel)
-                    else:
-                        normalized_channel = torch.where(
-                            channel_foreground,
-                            (channel - foreground_mean)
-                            / foreground_standard_deviation,
-                            0.0,
-                        )
-                normalized_channels.append(normalized_channel)
-            image = torch.stack(normalized_channels)
-        elif self.foreground_statistics is not None:
-            image = torch.where(
-                foreground,
-                (image - self.foreground_mean)
-                / self.foreground_standard_deviation,
-                0.0,
-            )
+            normalized_channels.append(normalized_channel)
+        image = torch.stack(normalized_channels)
 
         return {
             "image": image,
@@ -628,59 +553,6 @@ class ADNISliceDataset(Dataset[dict[str, object]]):
             "patient_id": item.patient_id,
             "slice_index": item.slice_index,
         }
-
-
-class RandomSlicesPerScanSampler(Sampler[int]):
-    """Select a new random subset of each scan's slices every epoch."""
-
-    def __init__(
-        self,
-        dataset: ADNISliceDataset,
-        slices_per_scan: int,
-        *,
-        seed: int,
-    ) -> None:
-        if slices_per_scan <= 0:
-            raise ValueError("slices_per_scan must be positive")
-
-        grouped_indices: dict[tuple[int, str], list[int]] = defaultdict(list)
-        for index, item in enumerate(dataset.slices):
-            grouped_indices[(item.label, item.sample_id)].append(index)
-
-        if not grouped_indices:
-            raise ValueError("Cannot sample slices from an empty dataset")
-
-        self.scan_indices = tuple(
-            tuple(indices) for indices in grouped_indices.values()
-        )
-        self.slices_per_scan = slices_per_scan
-        self.seed = seed
-        self.epoch = 0
-
-    def __iter__(self) -> Iterator[int]:
-        generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        self.epoch += 1
-
-        selected_indices: list[int] = []
-        for scan_indices in self.scan_indices:
-            count = min(self.slices_per_scan, len(scan_indices))
-            selection = torch.randperm(
-                len(scan_indices),
-                generator=generator,
-            )[:count]
-            selected_indices.extend(scan_indices[index] for index in selection)
-
-        order = torch.randperm(
-            len(selected_indices),
-            generator=generator,
-        ).tolist()
-        return iter(selected_indices[index] for index in order)
-
-    def __len__(self) -> int:
-        return sum(
-            min(self.slices_per_scan, len(scan_indices))
-            for scan_indices in self.scan_indices
-        )
 
 
 class DiagnosisPatientBalancedSampler(Sampler[int]):
@@ -808,29 +680,23 @@ def _patient_stratified_split(
 def create_adni_slice_dataloaders(
     data_dir: str | Path | None = None,
     *,
-    batch_size: int = 48,
+    batch_size: int = 8,
     validation_fraction: float = 0.2,
     seed: int = 42,
-    training_seed: int | None = None,
-    training_slices_per_scan: int | None = None,
-    split_level: str = "scan",
+    training_seed: int = 123,
     metadata_path: str | Path | None = None,
-    normalization: str = "training",
-    slice_context: int = 1,
-    balance_patients: bool = False,
-    excluded_sample_ids: Sequence[str] = (),
-    image_size: tuple[int, int] | None = (224, 224),
+    excluded_sample_ids: Sequence[str] = ("1012896",),
+    image_size: tuple[int, int] = FULL_FOREGROUND_CROP_SIZE,
     train_transform: Callable[[Tensor], Tensor] | None = None,
     evaluation_transform: Callable[[Tensor], Tensor] | None = None,
     num_workers: int = 0,
     pin_memory: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Create slice loaders after a deterministic grouped split.
+    """Create the final patient-separated, balanced 2.5D data loaders.
 
-    Groups are split before their records are flattened into individual
-    slices. A patient-level split additionally keeps repeat scans from one
-    patient together. With three-slice context, adjacent slices are assembled
-    only after splitting and always come from the centre slice's scan.
+    Complete patients are assigned to training or validation before scans are
+    flattened into centre-slice examples. Each example is always normalized
+    per context slice and contains previous/centre/next slices from one scan.
     """
 
     if batch_size <= 0:
@@ -839,21 +705,6 @@ def create_adni_slice_dataloaders(
         raise ValueError("validation_fraction must be between 0 and 1")
     if num_workers < 0:
         raise ValueError("num_workers cannot be negative")
-    if training_slices_per_scan is not None and training_slices_per_scan <= 0:
-        raise ValueError("training_slices_per_scan must be positive")
-    if split_level not in {"scan", "patient"}:
-        raise ValueError("split_level must be 'scan' or 'patient'")
-    if normalization not in {"training", "per-slice"}:
-        raise ValueError("normalization must be 'training' or 'per-slice'")
-    if slice_context not in {1, 3}:
-        raise ValueError("slice_context must be 1 or 3")
-    if training_slices_per_scan is not None and balance_patients:
-        raise ValueError(
-            "slice subsampling and patient balancing cannot both be enabled"
-        )
-
-    if training_seed is None:
-        training_seed = seed
 
     set_seed(seed)
     data_path = (
@@ -864,14 +715,12 @@ def create_adni_slice_dataloaders(
     if not data_path.is_dir():
         raise FileNotFoundError(f"ADNI data directory does not exist: {data_path}")
 
-    patient_ids = None
-    if split_level == "patient" or balance_patients:
-        resolved_metadata_path = (
-            data_path.parent / "meta_data_with_label.json"
-            if metadata_path is None
-            else Path(metadata_path)
-        )
-        patient_ids = _load_patient_ids(resolved_metadata_path)
+    resolved_metadata_path = (
+        data_path.parent / "meta_data_with_label.json"
+        if metadata_path is None
+        else Path(metadata_path)
+    )
+    patient_ids = _load_patient_ids(resolved_metadata_path)
 
     train_dir = _find_split_directory(data_path, ("train", "training"))
     test_dir = _find_split_directory(data_path, ("test", "testing"))
@@ -897,78 +746,44 @@ def create_adni_slice_dataloaders(
         raise RuntimeError(
             "A scan appears in both the provided train and test splits"
         )
-    if patient_ids is not None:
-        patient_labels: dict[str, int] = {}
-        for sample in (*training_subjects.samples, *test_subjects.samples):
-            previous_label = patient_labels.setdefault(
-                sample.patient_id,
-                sample.label,
+    patient_labels: dict[str, int] = {}
+    for sample in (*training_subjects.samples, *test_subjects.samples):
+        previous_label = patient_labels.setdefault(
+            sample.patient_id,
+            sample.label,
+        )
+        if previous_label != sample.label:
+            raise ValueError(
+                f"Patient {sample.patient_id!r} has both AD and NC scans"
             )
-            if previous_label != sample.label:
-                raise ValueError(
-                    f"Patient {sample.patient_id!r} has both AD and NC scans"
-                )
 
     scan_count = len(training_subjects)
     if scan_count < 2:
         raise ValueError("At least two grouped training scans are required")
-    if split_level == "patient":
-        training_indices, validation_indices = _patient_stratified_split(
-            training_subjects.samples,
-            validation_fraction,
-            seed,
-        )
-    else:
-        validation_count = max(1, round(scan_count * validation_fraction))
-        training_count = scan_count - validation_count
-        if training_count == 0:
-            raise ValueError("validation_fraction leaves no scans for training")
-        permutation = torch.randperm(
-            scan_count,
-            generator=torch.Generator().manual_seed(seed),
-        ).tolist()
-        training_indices = permutation[:training_count]
-        validation_indices = permutation[training_count:]
-
-    foreground_statistics = None
-    if normalization == "training":
-        foreground_statistics = _calculate_foreground_statistics(
-            training_subjects.samples,
-            training_indices,
-            image_size,
-        )
-    normalize_per_slice = normalization == "per-slice"
+    training_indices, validation_indices = _patient_stratified_split(
+        training_subjects.samples,
+        validation_fraction,
+        seed,
+    )
 
     training_slices = ADNISliceDataset(
         training_subjects,
         training_indices,
-        foreground_statistics=foreground_statistics,
-        normalize_per_slice=normalize_per_slice,
-        slice_context=slice_context,
         transform=train_transform,
     )
     validation_slices = ADNISliceDataset(
         training_subjects,
         validation_indices,
-        foreground_statistics=foreground_statistics,
-        normalize_per_slice=normalize_per_slice,
-        slice_context=slice_context,
         transform=evaluation_transform,
     )
     test_slices = ADNISliceDataset(
         test_subjects,
-        foreground_statistics=foreground_statistics,
-        normalize_per_slice=normalize_per_slice,
-        slice_context=slice_context,
         transform=evaluation_transform,
     )
 
     if set(training_slices.subject_ids) & set(validation_slices.subject_ids):
         raise RuntimeError("A scan appears in both training and validation")
-    if (
-        split_level == "patient"
-        and set(training_slices.patient_ids) & set(validation_slices.patient_ids)
-    ):
+    if set(training_slices.patient_ids) & set(validation_slices.patient_ids):
         raise RuntimeError("A patient appears in both training and validation")
 
     common_loader_options = {
@@ -981,22 +796,14 @@ def create_adni_slice_dataloaders(
         "persistent_workers": False,
         "worker_init_fn": _seed_worker,
     }
-    training_sampler = None
-    if training_slices_per_scan is not None:
-        training_sampler = RandomSlicesPerScanSampler(
-            training_slices,
-            training_slices_per_scan,
-            seed=training_seed,
-        )
-    elif balance_patients:
-        training_sampler = DiagnosisPatientBalancedSampler(
-            training_slices,
-            seed=training_seed,
-        )
+    training_sampler = DiagnosisPatientBalancedSampler(
+        training_slices,
+        seed=training_seed,
+    )
 
     train_loader = DataLoader(
         training_slices,
-        shuffle=training_sampler is None,
+        shuffle=False,
         sampler=training_sampler,
         generator=torch.Generator().manual_seed(training_seed + 1),
         **common_loader_options,

@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -47,7 +46,6 @@ DEFAULT_GRADIENT_CLIP = 1.0
 PLATEAU_PATIENCE = 5
 PLATEAU_FACTOR = 0.5
 PLATEAU_MIN_LR = 1e-6
-COSINE_MIN_LR = 1e-6
 
 
 @dataclass(frozen=True)
@@ -73,26 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
-    parser.add_argument(
-        "--input-mode",
-        choices=("crop", "resize"),
-        default="resize",
-        help=(
-            "Either take a foreground-centred crop at --image-size, or take "
-            "the complete 224-pixel foreground crop and resize it."
-        ),
-    )
-    parser.add_argument(
-        "--slice-context",
-        type=int,
-        choices=(1, 3),
-        default=3,
-        help=(
-            "Use one slice replicated over RGB channels, or use the previous, "
-            "centre and next slices as a 2.5D three-channel input."
-        ),
-    )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--stochastic-depth", type=float, default=0.1)
@@ -107,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--ema-decay",
         type=float,
         default=0.9999,
-        help="Model-weight EMA decay; zero disables EMA.",
+        help="Exponential moving-average decay for validation and checkpointing.",
     )
     parser.add_argument(
         "--amp-dtype",
@@ -115,36 +93,18 @@ def parse_args() -> argparse.Namespace:
         default="bfloat16",
         help="CUDA compute precision; float32 disables autocasting.",
     )
-    parser.add_argument(
-        "--augment-training",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--rotation-degrees", type=float, default=7.0)
     parser.add_argument("--translation-fraction", type=float, default=0.05)
     parser.add_argument("--scale-jitter", type=float, default=0.05)
     parser.add_argument("--intensity-jitter", type=float, default=0.10)
     parser.add_argument("--noise-standard-deviation", type=float, default=0.01)
-    parser.add_argument("--horizontal-flip-probability", type=float, default=0.0)
     parser.add_argument("--gamma-jitter", type=float, default=0.2)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
-    parser.add_argument(
-        "--learning-rate-scheduler",
-        choices=("plateau", "cosine"),
-        default="plateau",
-    )
     parser.add_argument(
         "--evaluate-only",
         action="store_true",
         help="Evaluate the saved best weights without training again.",
     )
-    parser.add_argument(
-        "--test-checkpoint",
-        choices=("loss", "accuracy", "last"),
-        default="loss",
-        help="Checkpoint to use for final test inference.",
-    )
-    parser.add_argument("--disable-early-stopping", action="store_true")
     parser.add_argument(
         "--gradient-clip",
         type=float,
@@ -156,32 +116,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_EARLY_STOPPING_START_EPOCH,
     )
     parser.add_argument("--validation-fraction", type=float, default=0.2)
-    parser.add_argument(
-        "--split-level",
-        choices=("scan", "patient"),
-        default="patient",
-    )
     parser.add_argument("--metadata-path", type=Path, default=None)
-    parser.add_argument(
-        "--normalization",
-        choices=("training", "per-slice"),
-        default="per-slice",
-    )
-    parser.add_argument(
-        "--balance-patients",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument(
         "--exclude-scan",
         action="append",
         default=["1012896"],
         help="Scan ID to omit before splitting; may be supplied more than once.",
-    )
-    parser.add_argument(
-        "--calibrate-threshold",
-        action=argparse.BooleanOptionalAction,
-        default=True,
     )
     parser.add_argument(
         "--target-recall",
@@ -202,12 +142,6 @@ def parse_args() -> argparse.Namespace:
         help="Seed for model initialization, batch order and slice sampling.",
     )
     parser.add_argument(
-        "--slices-per-scan-per-epoch",
-        type=int,
-        default=None,
-        help="Randomly select this many training slices from each scan per epoch.",
-    )
-    parser.add_argument(
         "--device",
         choices=("cpu", "cuda"),
         default=None,
@@ -219,8 +153,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be positive")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
-    if args.image_size < 32:
-        parser.error("--image-size must be at least 32 for ConvNeXt")
     if args.learning_rate <= 0:
         parser.error("--learning-rate must be positive")
     if args.weight_decay < 0:
@@ -231,8 +163,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--label-smoothing must be in [0, 1)")
     if args.mixup_alpha < 0:
         parser.error("--mixup-alpha cannot be negative")
-    if not 0.0 <= args.ema_decay < 1.0:
-        parser.error("--ema-decay must be in [0, 1)")
+    if not 0.0 < args.ema_decay < 1.0:
+        parser.error("--ema-decay must be in (0, 1)")
     if args.rotation_degrees < 0:
         parser.error("--rotation-degrees cannot be negative")
     if not 0.0 <= args.translation_fraction < 1.0:
@@ -243,8 +175,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--intensity-jitter must be in [0, 1)")
     if args.noise_standard_deviation < 0:
         parser.error("--noise-standard-deviation cannot be negative")
-    if not 0.0 <= args.horizontal_flip_probability <= 1.0:
-        parser.error("--horizontal-flip-probability must be in [0, 1]")
     if not 0.0 <= args.gamma_jitter < 1.0:
         parser.error("--gamma-jitter must be in [0, 1)")
     if args.target_recall is not None and not 0.0 < args.target_recall <= 1.0:
@@ -257,12 +187,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--early-stopping-start-epoch cannot be negative")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
-    if (
-        args.slices_per_scan_per_epoch is not None
-        and args.slices_per_scan_per_epoch <= 0
-    ):
-        parser.error("--slices-per-scan-per-epoch must be positive")
-
     return args
 
 
@@ -419,39 +343,6 @@ def create_warmup_scheduler(
         if warmup_epochs and epoch_index < warmup_epochs:
             return (epoch_index + 1) / warmup_epochs
         return 1.0
-
-    return torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        learning_rate_multiplier,
-    )
-
-
-def create_warmup_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    *,
-    total_epochs: int,
-    warmup_epochs: int,
-    minimum_learning_rate: float,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Warm up linearly, then anneal to a fixed minimum learning rate."""
-
-    warmup_epochs = min(warmup_epochs, total_epochs)
-    base_learning_rate = optimizer.param_groups[0]["lr"]
-    minimum_multiplier = min(minimum_learning_rate / base_learning_rate, 1.0)
-    cosine_epochs = max(total_epochs - warmup_epochs, 1)
-
-    def learning_rate_multiplier(epoch_index: int) -> float:
-        if warmup_epochs and epoch_index < warmup_epochs:
-            return (epoch_index + 1) / warmup_epochs
-        if total_epochs <= warmup_epochs:
-            return 1.0
-
-        progress = min(
-            max(epoch_index - warmup_epochs + 1, 0) / cosine_epochs,
-            1.0,
-        )
-        cosine_value = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return minimum_multiplier + (1.0 - minimum_multiplier) * cosine_value
 
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -1121,26 +1012,22 @@ def main(
     training_plot_title: str = "ConvNeXt Training History",
 ) -> None:
     args = parse_args()
-    training_seed = args.seed if args.training_seed is None else args.training_seed
+    training_seed = args.training_seed
     set_seed(training_seed)
-    image_size = (args.image_size, args.image_size)
-    loader_image_size = image_size
-    evaluation_transform = None
-    if args.input_mode == "resize":
-        loader_image_size = FULL_FOREGROUND_CROP_SIZE
-        evaluation_transform = partial(resize_tensor_image, size=args.image_size)
-    training_transform = evaluation_transform
-    if args.augment_training:
-        training_transform = MRITrainAugmentation(
-            size=args.image_size,
-            rotation_degrees=args.rotation_degrees,
-            translation_fraction=args.translation_fraction,
-            scale_jitter=args.scale_jitter,
-            intensity_jitter=args.intensity_jitter,
-            noise_standard_deviation=args.noise_standard_deviation,
-            horizontal_flip_probability=args.horizontal_flip_probability,
-            gamma_jitter=args.gamma_jitter,
-        )
+    image_size = (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)
+    evaluation_transform = partial(
+        resize_tensor_image,
+        size=DEFAULT_IMAGE_SIZE,
+    )
+    training_transform = MRITrainAugmentation(
+        size=DEFAULT_IMAGE_SIZE,
+        rotation_degrees=args.rotation_degrees,
+        translation_fraction=args.translation_fraction,
+        scale_jitter=args.scale_jitter,
+        intensity_jitter=args.intensity_jitter,
+        noise_standard_deviation=args.noise_standard_deviation,
+        gamma_jitter=args.gamma_jitter,
+    )
 
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1162,22 +1049,13 @@ def main(
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     best_weights_path = args.output_dir / "best_model_weights.pt"
-    best_accuracy_weights_path = (
-        args.output_dir / "best_accuracy_model_weights.pt"
-    )
     last_weights_path = args.output_dir / "last_model_weights.pt"
     last_ema_weights_path = args.output_dir / "last_ema_model_weights.pt"
     metrics_path = args.output_dir / "metrics.json"
-    checkpoint_paths = {
-        "loss": best_weights_path,
-        "accuracy": best_accuracy_weights_path,
-        "last": last_weights_path,
-    }
-    test_weights_path = checkpoint_paths[args.test_checkpoint]
-    if args.evaluate_only and not test_weights_path.is_file():
+    if args.evaluate_only and not best_weights_path.is_file():
         raise FileNotFoundError(
-            f"Cannot evaluate because the requested weights do not exist: "
-            f"{test_weights_path}"
+            f"Cannot evaluate because the best weights do not exist: "
+            f"{best_weights_path}"
         )
 
     train_loader, validation_loader, test_loader = create_adni_slice_dataloaders(
@@ -1186,14 +1064,9 @@ def main(
         validation_fraction=args.validation_fraction,
         seed=args.seed,
         training_seed=training_seed,
-        training_slices_per_scan=args.slices_per_scan_per_epoch,
-        split_level=args.split_level,
         metadata_path=args.metadata_path,
-        normalization=args.normalization,
-        slice_context=args.slice_context,
-        balance_patients=args.balance_patients,
         excluded_sample_ids=args.exclude_scan,
-        image_size=loader_image_size,
+        image_size=FULL_FOREGROUND_CROP_SIZE,
         train_transform=training_transform,
         evaluation_transform=evaluation_transform,
         num_workers=args.num_workers,
@@ -1237,80 +1110,45 @@ def main(
     print(f"Training scans: {training_dataset.subject_count}")
     print(f"Validation scans: {validation_loader.dataset.subject_count}")
     print(f"Test scans: {test_loader.dataset.subject_count}")
-    if args.split_level == "patient" or args.balance_patients:
-        print(f"Training patients: {training_dataset.patient_count}")
-        print(f"Validation patients: {validation_loader.dataset.patient_count}")
-        print(f"Test patients: {test_loader.dataset.patient_count}")
+    print(f"Training patients: {training_dataset.patient_count}")
+    print(f"Validation patients: {validation_loader.dataset.patient_count}")
+    print(f"Test patients: {test_loader.dataset.patient_count}")
     print(f"Training slices available: {len(training_dataset)}")
     print(f"Training slices selected per epoch: {len(train_loader.sampler)}")
     print(f"Validation slices: {len(validation_loader.dataset)}")
     print(f"Test slices: {len(test_loader.dataset)}")
-    print(f"Model input size: {args.image_size}x{args.image_size}")
-    if args.slice_context == 3:
-        print("Input channels: previous, centre and next slice (2.5D)")
-    else:
-        print("Input channels: centre slice copied across three channels (2D)")
-    if args.input_mode == "resize":
-        print("Input preprocessing: resize complete 224x224 foreground crop")
-    else:
-        print(f"Input preprocessing: fixed {args.image_size}x{args.image_size} crop")
-    if args.normalization == "per-slice":
-        print(
-            "Input normalization: per-slice foreground mean and "
-            "standard deviation"
-        )
-    else:
-        print(
-            f"Training foreground statistics: mean "
-            f"{training_dataset.foreground_mean:.4f}, standard deviation "
-            f"{training_dataset.foreground_standard_deviation:.4f}"
-        )
-    print(
-        f"Validation split level: {args.split_level}; "
-        f"patient-balanced sampling: {args.balance_patients}"
-    )
+    print(f"Model input size: {DEFAULT_IMAGE_SIZE}x{DEFAULT_IMAGE_SIZE}")
+    print("Input channels: previous, centre and next slice (2.5D)")
+    print("Input preprocessing: resize complete 224x224 foreground crop")
+    print("Input normalization: per-slice foreground mean and standard deviation")
+    print("Validation split level: patient; patient-balanced sampling: enabled")
     print(f"Trainable parameters: {trainable_parameters:,}")
     print(f"Split seed: {args.seed}; training seed: {training_seed}")
     print(f"CUDA compute precision: {args.amp_dtype}")
-    if args.augment_training:
-        print(
-            f"Training augmentation: rotation +/-{args.rotation_degrees:g} degrees; "
-            f"translation {args.translation_fraction:.0%}; scale +/-"
-            f"{args.scale_jitter:.0%}; intensity +/-{args.intensity_jitter:.0%}; "
-            f"noise standard deviation {args.noise_standard_deviation:g}; "
-            f"horizontal flip {args.horizontal_flip_probability:.0%}; "
-            f"gamma +/-{args.gamma_jitter:.0%}"
-        )
-    else:
-        print("Training augmentation: disabled")
-    checkpoint_description = (
-        "last"
-        if args.test_checkpoint == "last"
-        else f"best validation {args.test_checkpoint}"
+    print(
+        f"Training augmentation: rotation +/-{args.rotation_degrees:g} degrees; "
+        f"translation {args.translation_fraction:.0%}; scale +/-"
+        f"{args.scale_jitter:.0%}; intensity +/-{args.intensity_jitter:.0%}; "
+        f"noise standard deviation {args.noise_standard_deviation:g}; "
+        f"gamma +/-{args.gamma_jitter:.0%}"
     )
     print(
         f"Label smoothing: {args.label_smoothing:g}; "
-        f"final test checkpoint: {checkpoint_description}"
+        "final test checkpoint: best validation loss"
     )
+    print("AD decision threshold: selected on validation balanced accuracy")
     print(
-        "AD decision threshold: "
-        + (
-            "selected on validation balanced accuracy"
-            if args.calibrate_threshold
-            else "fixed at 0.5"
-        )
+        f"Secondary AD operating point: at least "
+        f"{args.target_recall:.0%} recall on validation data"
     )
-    if args.target_recall is not None:
-        print(
-            f"Secondary AD operating point: at least "
-            f"{args.target_recall:.0%} recall on validation data"
-        )
 
-    if args.evaluate_only:
-        print(f"Evaluation only; loading weights from: {test_weights_path}")
-        model.load_state_dict(
-            torch.load(test_weights_path, map_location=device, weights_only=True)
-        )
+    def evaluate_selected_model() -> tuple[
+        dict[str, float | int],
+        dict[str, float | int],
+        dict[str, object],
+    ]:
+        """Evaluate both validation-selected operating points on held-out data."""
+
         validation_loss, validation_results = infer_test_set(
             model,
             validation_loader,
@@ -1319,16 +1157,9 @@ def main(
             ad_index,
             autocast_dtype,
         )
-        decision_threshold = 0.5
-        if args.calibrate_threshold:
-            decision_threshold = select_validation_threshold(
-                validation_results,
-                ad_index=ad_index,
-            )
-        primary_operating_point_name = (
-            "balanced-accuracy operating point"
-            if args.calibrate_threshold
-            else "fixed 0.5 operating point"
+        decision_threshold = select_validation_threshold(
+            validation_results,
+            ad_index=ad_index,
         )
         validation_report = report_validation_results(
             validation_loss,
@@ -1336,7 +1167,7 @@ def main(
             ad_index=ad_index,
             nc_index=nc_index,
             decision_threshold=decision_threshold,
-            operating_point_name=primary_operating_point_name,
+            operating_point_name="balanced-accuracy operating point",
         )
         test_loss, test_results = infer_test_set(
             model,
@@ -1354,50 +1185,51 @@ def main(
             idx_to_class=idx_to_class,
             output_dir=args.output_dir,
             decision_threshold=decision_threshold,
-            operating_point_name=primary_operating_point_name,
+            operating_point_name="balanced-accuracy operating point",
         )
-        target_recall_report = None
-        if args.target_recall is not None:
-            target_recall_report = report_target_recall_operating_point(
-                target_recall=args.target_recall,
-                validation_loss=validation_loss,
-                validation_results=validation_results,
-                test_loss=test_loss,
-                test_results=test_results,
-                ad_index=ad_index,
-                nc_index=nc_index,
-                idx_to_class=idx_to_class,
-                output_dir=args.output_dir,
-            )
+        target_recall_report = report_target_recall_operating_point(
+            target_recall=args.target_recall,
+            validation_loss=validation_loss,
+            validation_results=validation_results,
+            test_loss=test_loss,
+            test_results=test_results,
+            ad_index=ad_index,
+            nc_index=nc_index,
+            idx_to_class=idx_to_class,
+            output_dir=args.output_dir,
+        )
+        return validation_report, test_metrics, target_recall_report
+
+    if args.evaluate_only:
+        print(f"Evaluation only; loading weights from: {best_weights_path}")
+        model.load_state_dict(
+            torch.load(best_weights_path, map_location=device, weights_only=True)
+        )
+        validation_report, test_metrics, target_recall_report = (
+            evaluate_selected_model()
+        )
         test_metrics_path = args.output_dir / "test_metrics.json"
         with test_metrics_path.open("w", encoding="utf-8") as metrics_file:
             json.dump(
                 {
-                    "weights": str(test_weights_path),
+                    "weights": str(best_weights_path),
                     "batch_size": args.batch_size,
                     "image_size": list(image_size),
-                    "input_mode": args.input_mode,
-                    "slice_context": args.slice_context,
+                    "input_mode": "resize",
+                    "slice_context": 3,
                     "label_smoothing": args.label_smoothing,
                     "mixup_alpha": args.mixup_alpha,
                     "ema_decay": args.ema_decay,
-                    "test_checkpoint": args.test_checkpoint,
+                    "test_checkpoint": "best validation loss",
                     "amp_dtype": args.amp_dtype,
-                    "augment_training": args.augment_training,
-                    "split_level": args.split_level,
-                    "normalization": args.normalization,
-                    "balance_patients": args.balance_patients,
+                    "augment_training": True,
+                    "split_level": "patient",
+                    "normalization": "per-slice",
+                    "balance_patients": True,
                     "excluded_scans": args.exclude_scan,
-                    "calibrate_threshold": args.calibrate_threshold,
-                    "decision_threshold": decision_threshold,
                     "target_recall": args.target_recall,
-                    "foreground_mean": training_dataset.foreground_mean,
-                    "foreground_standard_deviation": (
-                        training_dataset.foreground_standard_deviation
-                    ),
                     "seed": args.seed,
                     "training_seed": training_seed,
-                    "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
                     "validation": validation_report,
                     "test": test_metrics,
                     "target_recall_operating_point": target_recall_report,
@@ -1413,32 +1245,21 @@ def main(
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    model_ema = ModelEMA(model, args.ema_decay) if args.ema_decay else None
-    warmup_scheduler = None
-    plateau_scheduler = None
-    cosine_scheduler = None
-    if args.learning_rate_scheduler == "plateau":
-        warmup_scheduler = create_warmup_scheduler(
-            optimizer,
-            total_epochs=args.epochs,
-            warmup_epochs=args.warmup_epochs,
-        )
-        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=PLATEAU_FACTOR,
-            patience=PLATEAU_PATIENCE,
-            threshold=EARLY_STOPPING_MIN_DELTA,
-            threshold_mode="abs",
-            min_lr=PLATEAU_MIN_LR,
-        )
-    else:
-        cosine_scheduler = create_warmup_cosine_scheduler(
-            optimizer,
-            total_epochs=args.epochs,
-            warmup_epochs=args.warmup_epochs,
-            minimum_learning_rate=COSINE_MIN_LR,
-        )
+    model_ema = ModelEMA(model, args.ema_decay)
+    warmup_scheduler = create_warmup_scheduler(
+        optimizer,
+        total_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+    )
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=PLATEAU_FACTOR,
+        patience=PLATEAU_PATIENCE,
+        threshold=EARLY_STOPPING_MIN_DELTA,
+        threshold_mode="abs",
+        min_lr=PLATEAU_MIN_LR,
+    )
     scaler = None
     if device.type == "cuda" and autocast_dtype == torch.float16:
         scaler = torch.amp.GradScaler("cuda")
@@ -1448,44 +1269,28 @@ def main(
         f"warm-up epochs: {args.warmup_epochs}; "
         f"weight decay: {args.weight_decay:g}"
     )
-    if args.learning_rate_scheduler == "plateau":
-        print(
-            f"Plateau scheduler: factor {PLATEAU_FACTOR:g}, patience "
-            f"{PLATEAU_PATIENCE}, minimum learning rate {PLATEAU_MIN_LR:g}"
-        )
-    else:
-        print(
-            f"Cosine scheduler: anneal after warm-up to minimum learning "
-            f"rate {COSINE_MIN_LR:g}"
-        )
+    print(
+        f"Plateau scheduler: factor {PLATEAU_FACTOR:g}, patience "
+        f"{PLATEAU_PATIENCE}, minimum learning rate {PLATEAU_MIN_LR:g}"
+    )
     print(
         f"Stochastic depth: {args.stochastic_depth:g}; "
         f"gradient clipping: {args.gradient_clip:g}"
     )
     print(
         f"MixUp alpha: {args.mixup_alpha:g}; "
-        + (
-            f"EMA decay: {args.ema_decay:g}"
-            if model_ema is not None
-            else "EMA: disabled"
-        )
+        + f"EMA decay: {args.ema_decay:g}"
     )
-    if model_ema is not None:
-        print("Validation and best checkpoints use EMA weights")
-    if args.disable_early_stopping:
-        print(f"Early stopping: disabled; training all {args.epochs} epochs")
-    else:
-        print(
-            f"Early stopping: start after epoch "
-            f"{args.early_stopping_start_epoch}, patience "
-            f"{EARLY_STOPPING_PATIENCE}, minimum delta "
-            f"{EARLY_STOPPING_MIN_DELTA:g}"
-        )
+    print("Validation and best checkpoints use EMA weights")
+    print(
+        f"Early stopping: start after epoch "
+        f"{args.early_stopping_start_epoch}, patience "
+        f"{EARLY_STOPPING_PATIENCE}, minimum delta "
+        f"{EARLY_STOPPING_MIN_DELTA:g}"
+    )
 
     best_validation_loss = float("inf")
     best_epoch = 0
-    best_validation_accuracy = -1.0
-    best_accuracy_epoch = 0
     epochs_without_improvement = 0
     history: list[dict[str, Any]] = []
 
@@ -1503,7 +1308,7 @@ def main(
             mixup_alpha=args.mixup_alpha,
             model_ema=model_ema,
         )
-        validation_model = model_ema.module if model_ema is not None else model
+        validation_model = model_ema.module
         validation_metrics = run_epoch(
             validation_model,
             validation_loader,
@@ -1547,13 +1352,7 @@ def main(
                 f"{best_weights_path}"
             )
         else:
-            if args.disable_early_stopping:
-                epochs_without_improvement = 0
-                print(
-                    "  No minimum-delta improvement; fixed-epoch training "
-                    "continues."
-                )
-            elif epoch <= args.early_stopping_start_epoch:
+            if epoch <= args.early_stopping_start_epoch:
                 epochs_without_improvement = 0
                 print(
                     "  No minimum-delta improvement; early-stopping "
@@ -1568,43 +1367,20 @@ def main(
                     f"({epochs_without_improvement}/{EARLY_STOPPING_PATIENCE})"
                 )
 
-        if validation_metrics.accuracy > best_validation_accuracy:
-            best_validation_accuracy = validation_metrics.accuracy
-            best_accuracy_epoch = epoch
-            torch.save(
-                validation_model.state_dict(),
-                best_accuracy_weights_path,
-            )
-            print(
-                f"  Validation accuracy improved; saved weights to "
-                f"{best_accuracy_weights_path}"
-            )
-
         learning_rate_before_step = optimizer.param_groups[0]["lr"]
-        if args.learning_rate_scheduler == "cosine":
-            if cosine_scheduler is None:
-                raise RuntimeError("Cosine scheduler was not initialized")
-            cosine_scheduler.step()
+        if epoch < min(args.warmup_epochs, args.epochs):
+            warmup_scheduler.step()
         else:
-            if warmup_scheduler is None or plateau_scheduler is None:
-                raise RuntimeError("Plateau schedulers were not initialized")
-            if epoch < min(args.warmup_epochs, args.epochs):
-                warmup_scheduler.step()
-            else:
-                plateau_scheduler.step(validation_metrics.loss)
+            plateau_scheduler.step(validation_metrics.loss)
         learning_rate_after_step = optimizer.param_groups[0]["lr"]
         if learning_rate_after_step < learning_rate_before_step:
-            if args.learning_rate_scheduler == "plateau":
-                print(
-                    f"  Plateau scheduler reduced learning rate from "
-                    f"{learning_rate_before_step:.2e} to "
-                    f"{learning_rate_after_step:.2e}."
-                )
+            print(
+                f"  Plateau scheduler reduced learning rate from "
+                f"{learning_rate_before_step:.2e} to "
+                f"{learning_rate_after_step:.2e}."
+            )
 
-        if (
-            not args.disable_early_stopping
-            and epochs_without_improvement >= EARLY_STOPPING_PATIENCE
-        ):
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
             print(
                 f"Early stopping after epoch {epoch}: validation loss did not "
                 f"improve by at least {EARLY_STOPPING_MIN_DELTA:g} for "
@@ -1614,82 +1390,19 @@ def main(
 
     print(f"Training curves saved to: {training_curves_path}")
     torch.save(model.state_dict(), last_weights_path)
-    if model_ema is not None:
-        torch.save(model_ema.module.state_dict(), last_ema_weights_path)
+    torch.save(model_ema.module.state_dict(), last_ema_weights_path)
     print(f"Best epoch: {best_epoch} (validation loss {best_validation_loss:.4f})")
     print(f"Best weights saved to: {best_weights_path}")
-    print(
-        f"Best validation accuracy: {best_validation_accuracy:.2%} at epoch "
-        f"{best_accuracy_epoch}"
-    )
-    print(f"Best-accuracy weights saved to: {best_accuracy_weights_path}")
     print(f"Final weights saved to: {last_weights_path}")
-    if model_ema is not None:
-        print(f"Final EMA weights saved to: {last_ema_weights_path}")
+    print(f"Final EMA weights saved to: {last_ema_weights_path}")
 
-    test_weights_path = checkpoint_paths[args.test_checkpoint]
-    print(f"Testing weights selected by {args.test_checkpoint}: {test_weights_path}")
+    print(f"Testing best validation-loss weights: {best_weights_path}")
     model.load_state_dict(
-        torch.load(test_weights_path, map_location=device, weights_only=True)
+        torch.load(best_weights_path, map_location=device, weights_only=True)
     )
-    validation_loss, validation_results = infer_test_set(
-        model,
-        validation_loader,
-        evaluation_criterion,
-        device,
-        ad_index,
-        autocast_dtype,
+    validation_report, test_metrics, target_recall_report = (
+        evaluate_selected_model()
     )
-    decision_threshold = 0.5
-    if args.calibrate_threshold:
-        decision_threshold = select_validation_threshold(
-            validation_results,
-            ad_index=ad_index,
-        )
-    primary_operating_point_name = (
-        "balanced-accuracy operating point"
-        if args.calibrate_threshold
-        else "fixed 0.5 operating point"
-    )
-    validation_report = report_validation_results(
-        validation_loss,
-        validation_results,
-        ad_index=ad_index,
-        nc_index=nc_index,
-        decision_threshold=decision_threshold,
-        operating_point_name=primary_operating_point_name,
-    )
-    test_loss, test_results = infer_test_set(
-        model,
-        test_loader,
-        evaluation_criterion,
-        device,
-        ad_index,
-        autocast_dtype,
-    )
-    test_metrics = report_test_results(
-        test_loss,
-        test_results,
-        ad_index=ad_index,
-        nc_index=nc_index,
-        idx_to_class=idx_to_class,
-        output_dir=args.output_dir,
-        decision_threshold=decision_threshold,
-        operating_point_name=primary_operating_point_name,
-    )
-    target_recall_report = None
-    if args.target_recall is not None:
-        target_recall_report = report_target_recall_operating_point(
-            target_recall=args.target_recall,
-            validation_loss=validation_loss,
-            validation_results=validation_results,
-            test_loss=test_loss,
-            test_results=test_results,
-            ad_index=ad_index,
-            nc_index=nc_index,
-            idx_to_class=idx_to_class,
-            output_dir=args.output_dir,
-        )
 
     with metrics_path.open("w", encoding="utf-8") as metrics_file:
         json.dump(
@@ -1698,47 +1411,39 @@ def main(
                     "epochs_requested": args.epochs,
                     "batch_size": args.batch_size,
                     "image_size": list(image_size),
-                    "input_mode": args.input_mode,
-                    "slice_context": args.slice_context,
-                    "split_level": args.split_level,
-                    "normalization": args.normalization,
-                    "balance_patients": args.balance_patients,
+                    "input_mode": "resize",
+                    "slice_context": 3,
+                    "split_level": "patient",
+                    "normalization": "per-slice",
+                    "balance_patients": True,
                     "excluded_scans": args.exclude_scan,
-                    "calibrate_threshold": args.calibrate_threshold,
-                    "decision_threshold": decision_threshold,
+                    "calibrate_threshold": True,
+                    "decision_threshold": validation_report[
+                        "decision_threshold"
+                    ],
                     "target_recall": args.target_recall,
-                    "foreground_mean": training_dataset.foreground_mean,
-                    "foreground_standard_deviation": (
-                        training_dataset.foreground_standard_deviation
-                    ),
                     "learning_rate": args.learning_rate,
-                    "learning_rate_scheduler": args.learning_rate_scheduler,
+                    "learning_rate_scheduler": "plateau",
                     "weight_decay": args.weight_decay,
                     "stochastic_depth": args.stochastic_depth,
                     "label_smoothing": args.label_smoothing,
                     "mixup_alpha": args.mixup_alpha,
                     "ema_decay": args.ema_decay,
-                    "test_checkpoint": args.test_checkpoint,
+                    "test_checkpoint": "loss",
                     "amp_dtype": args.amp_dtype,
-                    "augment_training": args.augment_training,
+                    "augment_training": True,
                     "rotation_degrees": args.rotation_degrees,
                     "translation_fraction": args.translation_fraction,
                     "scale_jitter": args.scale_jitter,
                     "intensity_jitter": args.intensity_jitter,
                     "noise_standard_deviation": args.noise_standard_deviation,
-                    "horizontal_flip_probability": (
-                        args.horizontal_flip_probability
-                    ),
                     "gamma_jitter": args.gamma_jitter,
                     "warmup_epochs": args.warmup_epochs,
                     "plateau_patience": PLATEAU_PATIENCE,
                     "plateau_factor": PLATEAU_FACTOR,
                     "plateau_min_lr": PLATEAU_MIN_LR,
-                    "cosine_min_lr": COSINE_MIN_LR,
                     "gradient_clip": args.gradient_clip,
-                    "early_stopping_enabled": (
-                        not args.disable_early_stopping
-                    ),
+                    "early_stopping_enabled": True,
                     "early_stopping_start_epoch": (
                         args.early_stopping_start_epoch
                     ),
@@ -1746,12 +1451,9 @@ def main(
                     "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
                     "seed": args.seed,
                     "training_seed": training_seed,
-                    "slices_per_scan_per_epoch": args.slices_per_scan_per_epoch,
                 },
                 "best_epoch": best_epoch,
-                "best_accuracy_epoch": best_accuracy_epoch,
-                "best_validation_accuracy": best_validation_accuracy,
-                "test_weights": str(test_weights_path),
+                "test_weights": str(best_weights_path),
                 "history": history,
                 "validation": validation_report,
                 "test": test_metrics,

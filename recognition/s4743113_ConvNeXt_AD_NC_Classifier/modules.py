@@ -1,13 +1,9 @@
 # Prompt:
 # Convert the official TorchVision ConvNeXt-Tiny source into a standalone,
 # layer-by-layer PyTorch implementation without using the prebuilt model. Use
-# it to classify each 2D ADNI slice independently while keeping subjects intact
-# when the data is split. Keep attribution to the ConvNeXt paper and
-# TorchVision source.
-#
-# Superseded prompt from the first experiment:
-# Adapt the model by grouping each subject's slice features, averaging them as
-# in the basic CNN classifier, and producing one prediction per subject.
+# the previous, centre and next ADNI slices as its three input channels and
+# predict the centre slice, while keeping patients intact when splitting the
+# data. Keep attribution to the ConvNeXt paper and TorchVision source.
 
 """Standalone ConvNeXt modules for slice-level ADNI classification.
 
