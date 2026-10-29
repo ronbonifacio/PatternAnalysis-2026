@@ -666,6 +666,35 @@ def print_examples(
         )
 
 
+def save_slice_predictions(
+    results: list[TestResult],
+    output_dir: Path,
+    *,
+    ad_index: int,
+    filename: str,
+) -> Path:
+    """Write per-slice AD probabilities so ROC curves can be plotted later."""
+
+    path = output_dir / filename
+    with path.open("w", encoding="utf-8") as predictions_file:
+        json.dump(
+            {
+                "ad_index": ad_index,
+                "results": [
+                    {
+                        "sample_id": result.sample_id,
+                        "slice_index": result.slice_index,
+                        "target": result.target,
+                        "ad_probability": result.ad_probability,
+                    }
+                    for result in results
+                ],
+            },
+            predictions_file,
+        )
+    return path
+
+
 def report_test_results(
     test_loss: float,
     results: list[TestResult],
@@ -1188,6 +1217,18 @@ def main(
             decision_threshold=decision_threshold,
             operating_point_name="balanced-accuracy operating point",
         )
+        for results, filename in (
+            (validation_results, "validation_slice_predictions.json"),
+            (test_results, "test_slice_predictions.json"),
+        ):
+            path = save_slice_predictions(
+                results,
+                args.output_dir,
+                ad_index=ad_index,
+                filename=filename,
+            )
+            print(f"Slice predictions saved to: {path}")
+
         target_recall_report = report_target_recall_operating_point(
             target_recall=args.target_recall,
             validation_loss=validation_loss,
